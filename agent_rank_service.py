@@ -6,7 +6,7 @@ AgentRankService (updated):
 """
 
 import math
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from log_store import LogStore
 from domain_registry import DomainRegistry
 
@@ -22,21 +22,20 @@ DEFAULT_GLOBAL_CONFIG = {
 
 # 2. DOMAIN/TASK SPECIFIC WEIGHTS
 # These override the above if the domain/task matches.
-DOMAIN_SCORING_CONFIG: Dict[(str, str), Dict[str, Any]] = {
+DOMAIN_SCORING_CONFIG: Dict[Tuple[str, str], Dict[str, Any]] = {
     ("nlp", "summarize"): {
         "weights": {
             "success_rate": 0.30,
-            "quality_score": 0.50,  # accuracy matters most for summarization
+            "quality_score": 0.50,
             "latency_score": 0.10,
             "failure_rate": -0.10,
         }
     },
-
     ("nlp", "chat"): {
         "weights": {
             "success_rate": 0.40,
             "quality_score": 0.20,
-            "latency_score": 0.30,  # speed matters heavily
+            "latency_score": 0.30,
             "failure_rate": -0.10,
         }
     },

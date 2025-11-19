@@ -1,17 +1,17 @@
-# log_store.py
 """
 In-memory log store + metric computation for AgentRank.
-Good enough for a hackathon demo.
+Now includes:
+- call count per agent (n_a)
+- total call count (N)
 """
 
 from typing import Dict, Any, List
 import time
-import math
 
 
 class LogStore:
     def __init__(self):
-        # each entry: {agent_id, success, quality_score, latency_ms, failure_reason, timestamp}
+        # Each entry tracks one invocation
         self._logs: List[Dict[str, Any]] = []
 
     def record_invocation(self, metrics: Dict[str, Any]) -> None:
@@ -25,15 +25,20 @@ class LogStore:
         }
         self._logs.append(entry)
 
-    def _filter_by_agent(self, agent_id: str) -> List[Dict[str, Any]]:
+    def _entries_for(self, agent_id: str) -> List[Dict[str, Any]]:
         return [e for e in self._logs if e["agent_id"] == agent_id]
+
+    def total_calls(self) -> int:
+        return len(self._logs)
+
+    def calls_for_agent(self, agent_id: str) -> int:
+        return len(self._entries_for(agent_id))
 
     def compute_metrics(self, agent_id: str) -> Dict[str, float]:
         """
-        Compute simple aggregate metrics for an agent.
-        If no history exists, return neutral values (0.5).
+        Compute metrics from logs. If no logs → neutral defaults.
         """
-        entries = self._filter_by_agent(agent_id)
+        entries = self._entries_for(agent_id)
         if not entries:
             return {
                 "success_rate": 0.5,
@@ -48,15 +53,12 @@ class LogStore:
         avg_quality = sum(e["quality_score"] for e in entries) / n
         avg_latency = sum(e["latency_ms"] for e in entries) / n
 
-        # map latency (0..3000+ ms) to 1..0
+        # Normalize latency to 1 = fast, 0 = slow (3s cutoff)
         latency_score = 1.0 - min(avg_latency / 3000.0, 1.0)
 
-        success_rate = successes / n
-        failure_rate = failures / n
-
         return {
-            "success_rate": success_rate,
+            "success_rate": successes / n,
             "quality_score": avg_quality,
             "latency_score": latency_score,
-            "failure_rate": failure_rate,
+            "failure_rate": failures / n,
         }

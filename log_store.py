@@ -15,6 +15,8 @@ class LogStore:
         self._logs: List[Dict[str, Any]] = []
 
     def record_invocation(self, metrics: Dict[str, Any]) -> None:
+        print("DEBUG LOG ENTRY AGENT ID:", repr(metrics["agent_id"]))
+        # print("DEBUG → LogStore ID used for logging:", id(self))
         entry = {
             "agent_id": metrics["agent_id"],
             "success": int(metrics["success"]),
@@ -38,6 +40,7 @@ class LogStore:
         """
         Compute metrics from logs. If no logs → neutral defaults.
         """
+        
         entries = self._entries_for(agent_id)
         if not entries:
             return {

@@ -16,6 +16,7 @@ from agent_client import AgentClient
 
 def main():
     logs = LogStore()
+    print("DEBUG → LogStore ID (main):", id(logs))
     registry = DomainRegistry()
     rank_service = AgentRankService(logs, registry)
     client = AgentClient(rank_service)

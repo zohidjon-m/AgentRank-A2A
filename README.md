@@ -1,7 +1,7 @@
-# 🧠 AgentRank: Intelligent Agent Selection Layer for A2A Ecosystems
+#  AgentRank: Intelligent Agent Selection Layer for A2A Ecosystems
 *A domain-aware, learning, exploration-enabled ranking engine for multi-agent systems.*
 
-## 📌 Overview
+##  Overview
 Modern multi-agent environments often contain **multiple agents that provide similar capabilities** (e.g., summarizers, translators, recruiters).  
 The A2A protocol defines how agents communicate, but it does **not** define how to select the best agent.
 
@@ -11,7 +11,7 @@ The A2A protocol defines how agents communicate, but it does **not** define how 
 - exploration techniques  
 - learning from logs  
 
-## 🚀 Features
+##  Features
 - Intelligent agent selection  
 - Config-driven scoring  
 - Domain-aware policies  
@@ -19,18 +19,18 @@ The A2A protocol defines how agents communicate, but it does **not** define how 
 - Dynamic learning  
 - A2A integration  
 
-## 🏗 Architecture
+##  Architecture
 ```
 Client Agent → AgentRank Service → Best Agent → A2A Request → Logs
 ```
 
-## 📊 Metrics
+## Metrics
 - **Success Rate (SR)**  
 - **Quality Score (QS)**  
 - **Latency Score (LS)**  
 - **Failure Rate (FR)**  
 
-## 🧮 Ranking Algorithm
+##  Ranking Algorithm
 ### 1. Base Score
 ```
 base_score = wSR·SR + wQS·QS + wLS·LS + wFR·FR
@@ -46,7 +46,7 @@ exploration = α * sqrt( ln(1+N) / (1+n_a) )
 final_score = base_score + exploration
 ```
 
-## 🧱 Project Structure
+##  Project Structure
 ```
 │ run_demo.py
 │ agent_client.py
@@ -57,10 +57,10 @@ final_score = base_score + exploration
 └ agents/
 ```
 
-## ▶ Running
+##  Running
 ```
 python run_demo.py
 ```
 
-## 🏁 Conclusion
+##  Conclusion
 AgentRank transforms a static multi-agent system into a **self-optimizing, intelligent, scalable ecosystem**.

@@ -14,6 +14,37 @@ class LogStore:
         # Each entry tracks one invocation
         self._logs: List[Dict[str, Any]] = []
 
+    def _default_metrics_for(self, agent_id: str) -> Dict[str, float]:
+        default_profiles = {
+            "SummarizerFast": {
+                "success_rate": 0.95,
+                "quality_score": 0.5,
+                "latency_score": 0.9,
+                "failure_rate": 0.05,
+            },
+            "SummarizerQuality": {
+                "success_rate": 0.98,
+                "quality_score": 0.9,
+                "latency_score": 0.7,
+                "failure_rate": 0.02,
+            },
+            "SummarizerHallucinator": {
+                "success_rate": 0.7,
+                "quality_score": 0.2,
+                "latency_score": 0.6,
+                "failure_rate": 0.3,
+            },
+        }
+        return default_profiles.get(
+            agent_id,
+            {
+                "success_rate": 0.5,
+                "quality_score": 0.5,
+                "latency_score": 0.5,
+                "failure_rate": 0.5,
+            },
+        )
+
     def record_invocation(self, metrics: Dict[str, Any]) -> None:
         print("DEBUG LOG ENTRY AGENT ID:", repr(metrics["agent_id"]))
         # print("DEBUG → LogStore ID used for logging:", id(self))
@@ -38,17 +69,12 @@ class LogStore:
 
     def compute_metrics(self, agent_id: str) -> Dict[str, float]:
         """
-        Compute metrics from logs. If no logs → neutral defaults.
+        Compute metrics from logs. If no logs → default profile.
         """
         
         entries = self._entries_for(agent_id)
         if not entries:
-            return {
-                "success_rate": 0.5,
-                "quality_score": 0.5,
-                "latency_score": 0.5,
-                "failure_rate": 0.5,
-            }
+            return self._default_metrics_for(agent_id)
 
         n = len(entries)
         successes = sum(e["success"] for e in entries)

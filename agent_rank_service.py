@@ -1,45 +1,77 @@
-# agent_rank_service.py
 """
-AgentRank service: given a domain/task, rank candidate agents using log-based metrics.
+AgentRank service: rank candidate agents using log-derived base metrics
+plus a UCB exploration bonus.
+
+Score formula (per agent a, in domain d):
+
+    base(a)    = sum_k weight_d[k] * metric_a[k]
+    explore(a) = alpha_d * sqrt( ln(1 + N) / (1 + n_a) )
+    score(a)   = base(a) + explore(a)
+
+Where N is the total number of recorded invocations and n_a is the
+number for this agent. The exploration term encourages trying agents
+with few observations even when their current point estimate is lower
+than the current leader. This is the standard UCB1 trick.
 """
 
+import math
 from typing import List, Dict, Any
+
 from log_store import LogStore
 from domain_registry import DomainRegistry
+from config_loader import ScoringConfig
 
 
 class AgentRankService:
-    def __init__(self, log_store: LogStore, registry: DomainRegistry):
+    def __init__(
+        self,
+        log_store: LogStore,
+        registry: DomainRegistry,
+        config: ScoringConfig,
+    ):
         self.log_store = log_store
         self.registry = registry
+        self.config = config
 
     def rank(self, domain: str, task_type: str, payload: str) -> List[Dict[str, Any]]:
         """
-        Returns a sorted list of agents with scores and underlying metrics.
-        Highest score first.
+        Returns candidate agents sorted by score (highest first).
+        Each entry exposes the base score and exploration bonus separately
+        so callers can show why a given agent was chosen.
         """
-        # print("DEBUG → LogStore ID used for ranking:", id(self.log_store))
-        
         candidates = self.registry.get_agents(domain, task_type)
+        domain_key = f"{domain}/{task_type}"
+        policy = self.config.policy_for(domain_key)
+        weights = policy["weights"]
+        alpha = policy["exploration"]["alpha"]
+
+        total_calls = self.log_store.total_calls()
         results: List[Dict[str, Any]] = []
 
         for agent_id in candidates:
-            print("DEBUG RANKING FOR:", repr(agent_id))
-
             m = self.log_store.compute_metrics(agent_id)
 
-            # very simple scoring function for demo
-            score = (
-                0.4 * m["success_rate"]
-                + 0.3 * m["quality_score"]
-                + 0.2 * m["latency_score"]
-                - 0.1 * m["failure_rate"]
+            base_score = (
+                weights["success_rate"] * m["success_rate"]
+                + weights["quality_score"] * m["quality_score"]
+                + weights["latency_score"] * m["latency_score"]
+                + weights["failure_rate"] * m["failure_rate"]
             )
+
+            n_a = self.log_store.calls_for_agent(agent_id)
+            exploration_bonus = alpha * math.sqrt(
+                math.log(1 + total_calls) / (1 + n_a)
+            )
+
+            final_score = base_score + exploration_bonus
 
             results.append(
                 {
                     "agent_id": agent_id,
-                    "score": round(score, 4),
+                    "score": round(final_score, 4),
+                    "base_score": round(base_score, 4),
+                    "exploration_bonus": round(exploration_bonus, 4),
+                    "n_a": n_a,
                     "metrics": m,
                 }
             )

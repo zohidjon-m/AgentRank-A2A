@@ -1,0 +1,5 @@
+# Runtime: stdlib only. Python 3.9+ recommended.
+
+# Optional, used by evaluation/run_eval.py for plotting regret curves.
+# The eval still works without this — it just skips PNG output.
+matplotlib>=3.5

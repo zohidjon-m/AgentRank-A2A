@@ -7,3 +7,6 @@ __pycache__/
 # AgentRank persistence
 *.db
 *.db-journal
+
+# Evaluation outputs (regenerable; run `python -m evaluation.run_eval`)
+evaluation/results/

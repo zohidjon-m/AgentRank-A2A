@@ -33,7 +33,7 @@ from evaluation.strategies import (
     EpsilonGreedyStrategy,
     AgentRankStrategy,
 )
-from evaluation.runner import run_trial
+from evaluation.runner import run_trial, oracle_per_step
 from evaluation.metrics import (
     cumulative_regret,
     final_summary,
@@ -75,6 +75,24 @@ def build_strategies(scenario: Scenario, config: ScoringConfig, seed: int):
                 variant_suffix="_decayed",
             )
         )
+    if scenario.enable_linucb_variant_extractor is not None:
+        # LinUCB's exploration term scales with feature magnitudes;
+        # alpha=0.5 ensures enough early exploration to discover
+        # per-context optima. (UCB1 keeps its lower alpha — it doesn't
+        # have the same feature-vector scaling.)
+        linucb_cfg = config.with_bandit(
+            "nlp/summarize",
+            kind="linucb",
+            feature_extractor=scenario.enable_linucb_variant_extractor,
+            bandit_params={"alpha": 0.5, "ridge": 1.0},
+        )
+        strategies.append(
+            AgentRankStrategy(
+                linucb_cfg, domain="nlp", task_type="summarize",
+                candidates=scenario.candidates(), priors=scenario.priors,
+                variant_suffix="_linucb",
+            )
+        )
     return strategies
 
 
@@ -85,25 +103,30 @@ def run_scenario(
     n_trials: int,
 ) -> Dict[str, Any]:
     """Run all strategies on a scenario across n_trials seeds and average."""
-    # Oracle is per-step so drift scenarios are scored honestly.
-    oracle_per_step = [scenario.oracle_reward_at_step(t) for t in range(n_steps)]
-    oracle_mean = sum(oracle_per_step) / n_steps if n_steps else 0.0
     per_strategy: Dict[str, Dict[str, Any]] = {}
 
     # We accumulate regret curves across trials, then average pointwise.
     regret_accumulators: Dict[str, List[List[float]]] = {}
     summaries: Dict[str, List[Dict[str, Any]]] = {}
+    oracle_means_per_trial: List[float] = []
 
     for trial in range(n_trials):
         seed = 1234 + trial
+        # Oracle is per-step and per-trial (so contextual scenarios
+        # match the payload stream the strategies see).
+        oracle = oracle_per_step(scenario, n_steps, seed=seed)
+        oracle_means_per_trial.append(sum(oracle) / n_steps if n_steps else 0.0)
+
         strategies = build_strategies(scenario, config, seed)
         for strat in strategies:
             history = run_trial(strat, scenario, n_steps, seed=seed)
-            regret_curve = cumulative_regret(history, oracle_per_step)
-            summary = final_summary(history, oracle_per_step)
+            regret_curve = cumulative_regret(history, oracle)
+            summary = final_summary(history, oracle)
 
             regret_accumulators.setdefault(strat.name, []).append(regret_curve)
             summaries.setdefault(strat.name, []).append(summary)
+
+    oracle_mean = statistics.mean(oracle_means_per_trial) if oracle_means_per_trial else 0.0
 
     # Average across trials.
     for name, curves in regret_accumulators.items():

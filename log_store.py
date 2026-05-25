@@ -50,7 +50,8 @@ class LogStore:
                 timestamp REAL NOT NULL,
                 judge_name TEXT,
                 judge_reason TEXT,
-                agent_claimed_quality REAL
+                agent_claimed_quality REAL,
+                context_features TEXT
             )
             """
         )
@@ -58,13 +59,14 @@ class LogStore:
             "CREATE INDEX IF NOT EXISTS idx_invocations_agent ON invocations(agent_id)"
         )
 
-        # Best-effort migration for databases created before the judge
-        # columns existed. ALTER TABLE ... ADD COLUMN is idempotent in
-        # SQLite only if we guard against duplicate-column errors.
+        # Best-effort migration for databases created before later columns
+        # existed. ALTER TABLE ADD COLUMN is idempotent here only if we
+        # guard against duplicate-column errors.
         for col, decl in [
             ("judge_name", "TEXT"),
             ("judge_reason", "TEXT"),
             ("agent_claimed_quality", "REAL"),
+            ("context_features", "TEXT"),
         ]:
             try:
                 self._conn.execute(f"ALTER TABLE invocations ADD COLUMN {col} {decl}")
@@ -76,13 +78,24 @@ class LogStore:
     # ---- writes ------------------------------------------------------------
 
     def record_invocation(self, metrics: Dict[str, Any]) -> None:
+        # context_features may arrive as a list/array (from a feature
+        # extractor) or as a pre-encoded JSON string. Normalize to text.
+        ctx = metrics.get("context_features")
+        if ctx is not None and not isinstance(ctx, str):
+            import json
+            try:
+                ctx = json.dumps(list(ctx))
+            except (TypeError, ValueError):
+                ctx = None
+
         self._conn.execute(
             """
             INSERT INTO invocations
                 (agent_id, success, quality_score, latency_ms,
                  failure_reason, timestamp,
-                 judge_name, judge_reason, agent_claimed_quality)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 judge_name, judge_reason, agent_claimed_quality,
+                 context_features)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 metrics["agent_id"],
@@ -94,9 +107,25 @@ class LogStore:
                 metrics.get("judge_name"),
                 metrics.get("judge_reason"),
                 metrics.get("agent_claimed_quality"),
+                ctx,
             ),
         )
         self._conn.commit()
+
+    def get_contextual_logs(self, agent_id: str):
+        """
+        Yield rows containing the fields LinUCB needs: success,
+        quality_score, latency_ms, context_features (JSON text).
+        Skips entries that never had features attached.
+        """
+        return self._conn.execute(
+            """
+            SELECT success, quality_score, latency_ms, context_features
+            FROM invocations
+            WHERE agent_id = ? AND context_features IS NOT NULL
+            """,
+            (agent_id,),
+        ).fetchall()
 
     # ---- reads -------------------------------------------------------------
 

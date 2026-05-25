@@ -1,25 +1,23 @@
 """
-AgentRank service: rank candidate agents using log-derived base metrics
-plus a UCB exploration bonus.
+AgentRank service: ranks candidate agents using a pluggable bandit
+policy. UCB1 is the default (context-blind); LinUCB plugs in when a
+domain configures a feature extractor.
 
-Score formula (per agent a, in domain d):
-
-    base(a)    = sum_k weight_d[k] * metric_a[k]
-    explore(a) = alpha_d * sqrt( ln(1 + N) / (1 + n_a) )
-    score(a)   = base(a) + explore(a)
-
-Where N is the total number of recorded invocations and n_a is the
-number for this agent. The exploration term encourages trying agents
-with few observations even when their current point estimate is lower
-than the current leader. This is the standard UCB1 trick.
+This module is intentionally thin: it loads the right bandit + extractor
+for the requested domain and delegates. Everything algorithmic lives in
+bandits.py and feature_extractor.py.
 """
 
-import math
-from typing import List, Dict, Any
+import json
+from typing import List, Dict, Any, Optional, Tuple
+
+import numpy as np
 
 from log_store import LogStore
 from domain_registry import DomainRegistry
 from config_loader import ScoringConfig
+from bandits import build_bandit
+from feature_extractor import get_extractor, PayloadFeatureExtractor
 
 
 class AgentRankService:
@@ -33,56 +31,58 @@ class AgentRankService:
         self.registry = registry
         self.config = config
 
-    def rank(self, domain: str, task_type: str, payload: str) -> List[Dict[str, Any]]:
+    def rank(
+        self,
+        domain: str,
+        task_type: str,
+        payload: str,
+    ) -> List[Dict[str, Any]]:
         """
         Returns candidate agents sorted by score (highest first).
-        Each entry exposes the base score and exploration bonus separately
-        so callers can show why a given agent was chosen.
 
-        Honors the per-domain drift policy: when half_life_calls is set,
-        both the metric averages and the UCB counts use exponentially-
-        decayed weights, so old observations stop dominating the ranker.
+        For backwards compatibility the returned dicts have the same
+        shape as before: agent_id, score, base_score, exploration_bonus,
+        n_a, metrics, bandit.
+        """
+        ranking, _ = self.rank_with_features(domain, task_type, payload)
+        return ranking
+
+    def rank_with_features(
+        self,
+        domain: str,
+        task_type: str,
+        payload: str,
+    ) -> Tuple[List[Dict[str, Any]], Optional[np.ndarray]]:
+        """
+        Same as rank(), but also returns the extracted feature vector
+        (or None when no extractor is configured). AgentClient persists
+        this alongside the invocation so the bandit can learn from it.
         """
         candidates = self.registry.get_agents(domain, task_type)
         domain_key = f"{domain}/{task_type}"
         policy = self.config.policy_for(domain_key)
-        weights = policy["weights"]
-        alpha = policy["exploration"]["alpha"]
-        half_life = policy.get("drift", {}).get("half_life_calls")
 
-        # Single batched read of decayed counts so we don't re-scan logs
-        # once per candidate.
-        total_weight, per_agent_weight = self.log_store.get_weighted_counts(half_life)
+        extractor = self._extractor_for(policy)
+        features: Optional[np.ndarray] = None
+        feature_dim = 0
+        if extractor is not None:
+            features = extractor.extract(payload)
+            feature_dim = extractor.dim
 
-        results: List[Dict[str, Any]] = []
+        bandit = build_bandit(policy, feature_dim=feature_dim)
+        ranking = bandit.rank(
+            candidates=candidates,
+            weights=policy["weights"],
+            log_store=self.log_store,
+            context_features=features,
+        )
+        return ranking, features
 
-        for agent_id in candidates:
-            m = self.log_store.compute_metrics(agent_id, half_life_calls=half_life)
+    # ---- helpers -----------------------------------------------------------
 
-            base_score = (
-                weights["success_rate"] * m["success_rate"]
-                + weights["quality_score"] * m["quality_score"]
-                + weights["latency_score"] * m["latency_score"]
-                + weights["failure_rate"] * m["failure_rate"]
-            )
-
-            n_a = per_agent_weight.get(agent_id, 0.0)
-            exploration_bonus = alpha * math.sqrt(
-                math.log(1 + total_weight) / (1 + n_a)
-            )
-
-            final_score = base_score + exploration_bonus
-
-            results.append(
-                {
-                    "agent_id": agent_id,
-                    "score": round(final_score, 4),
-                    "base_score": round(base_score, 4),
-                    "exploration_bonus": round(exploration_bonus, 4),
-                    "n_a": round(n_a, 2),
-                    "metrics": m,
-                }
-            )
-
-        results.sort(key=lambda r: r["score"], reverse=True)
-        return results
+    @staticmethod
+    def _extractor_for(policy: Dict[str, Any]) -> Optional[PayloadFeatureExtractor]:
+        name = policy.get("feature_extractor")
+        if not name:
+            return None
+        return get_extractor(name)

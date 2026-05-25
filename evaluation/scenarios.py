@@ -10,8 +10,9 @@ By varying the relationship between truth and priors we can isolate
 *why* AgentRank wins (or loses) against simpler baselines.
 """
 
+import random
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Callable
 
 from .simulator import TruthSpec
 
@@ -40,6 +41,19 @@ class Scenario:
     drift_agents: Optional[List[TruthSpec]] = None
     # When set, run_eval registers an AgentRank variant with this half-life.
     enable_decay_variant_half_life: Optional[float] = None
+    # When set, run_eval registers a LinUCB variant using this feature
+    # extractor name (must be present in feature_extractor.FEATURE_EXTRACTORS).
+    enable_linucb_variant_extractor: Optional[str] = None
+    # Optional payload generator. Returns the text payload for one
+    # request given an RNG. Defaults to empty string (no context).
+    payload_generator: Optional[Callable[[random.Random], str]] = field(
+        default=None, repr=False
+    )
+
+    def gen_payload(self, rng: random.Random) -> str:
+        if self.payload_generator is None:
+            return ""
+        return self.payload_generator(rng)
 
     def candidates(self) -> List[str]:
         return [a.agent_id for a in self.agents]
@@ -50,10 +64,15 @@ class Scenario:
             return self.drift_agents
         return self.agents
 
-    def oracle_reward_at_step(self, t: int) -> float:
-        """Best achievable expected reward at step t (post-drift if applicable)."""
+    def oracle_reward_at_step(self, t: int, features=None) -> float:
+        """
+        Best achievable expected reward at step t (post-drift if applicable).
+        When features are supplied, picks the best agent *for that context*
+        — this matters for contextual scenarios where different agents win
+        for different inputs.
+        """
         specs = self.specs_at_step(t)
-        return max(s.expected_reward(self.weights) for s in specs)
+        return max(s.expected_reward(self.weights, features=features) for s in specs)
 
     def oracle_agent(self) -> str:
         """The agent with the highest true expected reward at step 0."""
@@ -223,9 +242,97 @@ SCENARIO_CONCEPT_DRIFT = Scenario(
 )
 
 
+# ---------------------------------------------------------------------------
+# Scenario E: context-aware ranking.
+#
+# Same three agents, but now their quality is conditional on input length:
+#   SummarizerFast:    great on SHORT text  (quality ~0.90), poor on LONG (~0.30)
+#   SummarizerQuality: poor on SHORT (~0.45), great on LONG (~0.92)
+#   SummarizerHallucinator: bad everywhere.
+#
+# No single agent wins on average — the right answer depends on the
+# request. UCB1 can only learn one global preference and pays heavy
+# regret. LinUCB learns a per-agent reward function in feature space
+# and routes each request to the right agent.
+# ---------------------------------------------------------------------------
+
+
+def _short_specialist_quality(features) -> float:
+    # features = [intercept, norm_log_words, short_ind, long_ind]
+    # Sharp specialist: great on short, terrible on long.
+    short_ind = float(features[2])
+    long_ind = float(features[3])
+    if short_ind > 0.5:
+        return 0.95
+    if long_ind > 0.5:
+        return 0.15
+    return 0.45  # medium-length text
+
+
+def _long_specialist_quality(features) -> float:
+    # Inverse specialist: great on long, terrible on short.
+    short_ind = float(features[2])
+    long_ind = float(features[3])
+    if long_ind > 0.5:
+        return 0.95
+    if short_ind > 0.5:
+        return 0.20
+    return 0.60  # medium-length text
+
+
+def _flat_low_quality(features) -> float:
+    return 0.20
+
+
+def _varied_length_payload(rng: random.Random) -> str:
+    """Generates payloads of varied length (short / medium / long)."""
+    bucket = rng.choice(("short", "short", "medium", "long", "long"))
+    if bucket == "short":
+        n_words = rng.randint(5, 25)
+    elif bucket == "medium":
+        n_words = rng.randint(60, 130)
+    else:  # long
+        n_words = rng.randint(220, 380)
+    return " ".join(["word"] * n_words)
+
+
+SCENARIO_CONTEXT_AWARE = Scenario(
+    name="context_aware",
+    description=(
+        "Per-request optimum: SummarizerFast wins on short text, "
+        "SummarizerQuality wins on long text, SummarizerHallucinator "
+        "is bad everywhere. UCB1 can only learn one global preference; "
+        "LinUCB learns per-agent reward as a function of input length "
+        "features and routes each request to the right agent."
+    ),
+    agents=[
+        TruthSpec("SummarizerFast", success_prob=1.00, quality_mean=0.50,
+                  latency_min_ms=80, latency_max_ms=120,
+                  context_quality_fn=_short_specialist_quality),
+        TruthSpec("SummarizerQuality", success_prob=1.00, quality_mean=0.70,
+                  latency_min_ms=700, latency_max_ms=900,
+                  context_quality_fn=_long_specialist_quality),
+        TruthSpec("SummarizerHallucinator", success_prob=1.00, quality_mean=0.20,
+                  latency_min_ms=200, latency_max_ms=1200,
+                  context_quality_fn=_flat_low_quality),
+    ],
+    priors={
+        "SummarizerFast": {"success_rate": 0.95, "quality_score": 0.5,
+                           "latency_score": 0.9, "failure_rate": 0.05},
+        "SummarizerQuality": {"success_rate": 0.98, "quality_score": 0.7,
+                              "latency_score": 0.7, "failure_rate": 0.02},
+        "SummarizerHallucinator": {"success_rate": 1.0, "quality_score": 0.2,
+                                   "latency_score": 0.6, "failure_rate": 0.0},
+    },
+    payload_generator=_varied_length_payload,
+    enable_linucb_variant_extractor="length_bucket",
+)
+
+
 ALL_SCENARIOS = [
     SCENARIO_PRIORS_CORRECT,
     SCENARIO_HIDDEN_GEM,
     SCENARIO_LYING_AGENT,
     SCENARIO_CONCEPT_DRIFT,
+    SCENARIO_CONTEXT_AWARE,
 ]

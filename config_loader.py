@@ -33,6 +33,14 @@ _DEFAULT_POLICY = {
     # weight halves every N invocations. None / 0 disables decay
     # (flat averaging over all history — the original behavior).
     "drift": {"half_life_calls": None},
+    # Bandit policy: "ucb1" (context-blind, the default) or "linucb"
+    # (contextual; requires feature_extractor to be set).
+    "bandit": "ucb1",
+    # Optional name of a registered PayloadFeatureExtractor. Required for
+    # LinUCB; ignored by UCB1.
+    "feature_extractor": None,
+    # Optional per-bandit parameters (e.g., {"ridge": 1.0} for LinUCB).
+    "bandit_params": {},
 }
 
 
@@ -66,7 +74,17 @@ class ScoringConfig:
         weights = {**_DEFAULT_POLICY["weights"], **policy.get("weights", {})}
         exploration = {**_DEFAULT_POLICY["exploration"], **policy.get("exploration", {})}
         drift = {**_DEFAULT_POLICY["drift"], **policy.get("drift", {})}
-        return {"weights": weights, "exploration": exploration, "drift": drift}
+        bandit_params = {**_DEFAULT_POLICY["bandit_params"], **policy.get("bandit_params", {})}
+        return {
+            "weights": weights,
+            "exploration": exploration,
+            "drift": drift,
+            "bandit": policy.get("bandit", _DEFAULT_POLICY["bandit"]),
+            "feature_extractor": policy.get(
+                "feature_extractor", _DEFAULT_POLICY["feature_extractor"]
+            ),
+            "bandit_params": bandit_params,
+        }
 
     # ---- agent priors ------------------------------------------------------
 
@@ -124,11 +142,36 @@ class ScoringConfig:
         new_raw = copy.deepcopy(self._raw)
         scoring = new_raw.setdefault("scoring", {})
         domains = scoring.setdefault("domains", {})
-        # Inherit from default policy if this domain isn't defined yet.
         if domain_key not in domains:
             domains[domain_key] = copy.deepcopy(
                 scoring.get("default", _DEFAULT_POLICY)
             )
         domains[domain_key].setdefault("drift", {})
         domains[domain_key]["drift"]["half_life_calls"] = half_life_calls
+        return ScoringConfig(new_raw)
+
+    def with_bandit(
+        self,
+        domain_key: str,
+        kind: str,
+        feature_extractor: Optional[str] = None,
+        bandit_params: Optional[Dict[str, Any]] = None,
+    ) -> "ScoringConfig":
+        """
+        Return a clone with the bandit kind / feature extractor configured
+        for one domain. Used by the eval harness to register a LinUCB
+        variant without touching the persisted config.
+        """
+        new_raw = copy.deepcopy(self._raw)
+        scoring = new_raw.setdefault("scoring", {})
+        domains = scoring.setdefault("domains", {})
+        if domain_key not in domains:
+            domains[domain_key] = copy.deepcopy(
+                scoring.get("default", _DEFAULT_POLICY)
+            )
+        domains[domain_key]["bandit"] = kind
+        if feature_extractor is not None:
+            domains[domain_key]["feature_extractor"] = feature_extractor
+        if bandit_params is not None:
+            domains[domain_key]["bandit_params"] = dict(bandit_params)
         return ScoringConfig(new_raw)

@@ -25,22 +25,41 @@ class AgentClient:
         self.judge = judge
 
     def handle_task(self, domain: str, task_type: str, payload: str) -> Dict[str, Any]:
-        # 1) Ask AgentRank for the best agent.
-        ranking = self.rank_service.rank(domain, task_type, payload)
+        # 1) Ask AgentRank for the best agent (and the extracted features,
+        #    which we'll persist alongside the invocation so the bandit
+        #    can learn from them).
+        ranking, features = self.rank_service.rank_with_features(
+            domain, task_type, payload
+        )
 
         if not ranking:
             print("[AgentClient] No agents available for this task.")
             return {"error": "no_agents"}
 
-        print(f"\n[AgentRank] Ranking for domain={domain} task_type={task_type}")
+        bandit_kind = ranking[0].get("bandit", "ucb1")
+        print(
+            f"\n[AgentRank] Ranking for domain={domain} task_type={task_type} "
+            f"bandit={bandit_kind}"
+        )
         for r in ranking:
             m = r["metrics"]
+            # LinUCB doesn't aggregate the same way UCB1 does, so we
+            # render its internals when present and fall back to the
+            # UCB1 fields otherwise.
+            if "linucb_mean" in m:
+                tail = (
+                    f"| mean={m['linucb_mean']:+.3f} "
+                    f"conf={m['linucb_confidence']:.3f}"
+                )
+            else:
+                tail = (
+                    f"| SR={m['success_rate']:.2f} QS={m['quality_score']:.2f} "
+                    f"LS={m['latency_score']:.2f} FR={m['failure_rate']:.2f}"
+                )
             print(
                 f"  - {r['agent_id']:24s} | score={r['score']:.3f} "
                 f"(base={r['base_score']:.3f} +explore={r['exploration_bonus']:.3f}) "
-                f"| n={r['n_a']:>5.1f} "
-                f"| SR={m['success_rate']:.2f} QS={m['quality_score']:.2f} "
-                f"LS={m['latency_score']:.2f} FR={m['failure_rate']:.2f}"
+                f"| n={r['n_a']:>5.1f} {tail}"
             )
 
         best = ranking[0]["agent_id"]
@@ -84,7 +103,10 @@ class AgentClient:
                 metrics["judge_error"] = str(e)
                 print(f"[Judge] error: {e}")
 
-        # 5) Record metrics for future rankings.
+        # 5) Attach the context features (if any) so contextual bandits
+        #    can learn from this call, then record.
+        if features is not None:
+            metrics["context_features"] = features.tolist()
         if metrics:
             self.rank_service.log_store.record_invocation(metrics)
 

@@ -19,8 +19,10 @@ in eval see the truth.
 """
 
 import random
-from dataclasses import dataclass
-from typing import Dict, Any, Optional
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional, Callable
+
+import numpy as np
 
 
 @dataclass
@@ -33,6 +35,14 @@ class TruthSpec:
     latency_min_ms: int = 100
     latency_max_ms: int = 100
     claimed_quality_mean: Optional[float] = None  # what the agent self-reports
+    # Optional context-conditional quality: a function mapping a feature
+    # vector to the agent's TRUE quality mean for that request. When set,
+    # this overrides quality_mean. Used to model "agent A is great on
+    # short text, agent B on long" so contextual bandits have something
+    # to learn.
+    context_quality_fn: Optional[Callable[[np.ndarray], float]] = field(
+        default=None, repr=False
+    )
 
     @property
     def claim_mean(self) -> float:
@@ -45,18 +55,40 @@ class TruthSpec:
     def is_honest(self) -> bool:
         return abs(self.claim_mean - self.quality_mean) < 1e-9
 
-    def sample(self, rng: random.Random) -> Dict[str, Any]:
+    def true_quality_mean_for(self, features: Optional[np.ndarray]) -> float:
+        if self.context_quality_fn is not None and features is not None:
+            return float(self.context_quality_fn(features))
+        return self.quality_mean
+
+    def sample(
+        self,
+        rng: random.Random,
+        features: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
         success = 1 if rng.random() < self.success_prob else 0
+        q_mean = self.true_quality_mean_for(features)
         if success:
             if self.quality_std > 0:
-                true_q = rng.gauss(self.quality_mean, self.quality_std)
+                true_q = rng.gauss(q_mean, self.quality_std)
                 true_q = max(0.0, min(1.0, true_q))
             else:
-                true_q = self.quality_mean
+                true_q = q_mean
         else:
             true_q = 0.0
 
-        claim_q = self.claim_mean if success else 0.0
+        # Claim semantics:
+        #   - claimed_quality_mean unset  -> HONEST: claim = true_q each call
+        #     (the agent reports what it actually delivered, which can
+        #     vary by context).
+        #   - claimed_quality_mean set    -> LIAR: claim = fixed inflated
+        #     value regardless of context (the lying-agent scenario).
+        if not success:
+            claim_q = 0.0
+        elif self.claimed_quality_mean is None:
+            claim_q = true_q
+        else:
+            claim_q = self.claimed_quality_mean
+
         latency_ms = rng.randint(self.latency_min_ms, self.latency_max_ms)
         return {
             "agent_id": self.agent_id,
@@ -67,10 +99,19 @@ class TruthSpec:
             "failure_reason": None if success else "synthetic_failure",
         }
 
-    def expected_reward(self, weights: Dict[str, float]) -> float:
-        """Analytic expected per-call reward using TRUE quality."""
+    def expected_reward(
+        self,
+        weights: Dict[str, float],
+        features: Optional[np.ndarray] = None,
+    ) -> float:
+        """
+        Analytic expected per-call reward using TRUE quality. When
+        features are supplied and context_quality_fn is set, the
+        expected reward conditions on context.
+        """
         p = self.success_prob
-        e_quality = p * self.quality_mean   # 0 on failure
+        q_mean = self.true_quality_mean_for(features)
+        e_quality = p * q_mean   # 0 on failure
         avg_latency = (self.latency_min_ms + self.latency_max_ms) / 2
         e_latency_score = 1.0 - min(avg_latency / 3000.0, 1.0)
         return (

@@ -18,10 +18,14 @@ class AgentRankService:
         Returns a sorted list of agents with scores and underlying metrics.
         Highest score first.
         """
+        # print("DEBUG → LogStore ID used for ranking:", id(self.log_store))
+        
         candidates = self.registry.get_agents(domain, task_type)
         results: List[Dict[str, Any]] = []
 
         for agent_id in candidates:
+            print("DEBUG RANKING FOR:", repr(agent_id))
+
             m = self.log_store.compute_metrics(agent_id)
 
             # very simple scoring function for demo

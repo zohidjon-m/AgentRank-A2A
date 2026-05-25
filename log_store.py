@@ -111,14 +111,65 @@ class LogStore:
         ).fetchone()
         return int(row[0])
 
-    def compute_metrics(self, agent_id: str) -> Dict[str, float]:
+    def _current_tick(self) -> int:
+        """Highest id ever inserted. AUTOINCREMENT guarantees monotonicity."""
+        row = self._conn.execute("SELECT MAX(id) FROM invocations").fetchone()
+        return int(row[0]) if row[0] is not None else 0
+
+    @staticmethod
+    def _decay_weight(entry_id: int, current_tick: int, half_life: Optional[float]) -> float:
+        if not half_life or half_life <= 0:
+            return 1.0
+        age = max(0, current_tick - entry_id)
+        return 0.5 ** (age / half_life)
+
+    def get_weighted_counts(
+        self,
+        half_life_calls: Optional[float] = None,
+    ) -> tuple:
+        """
+        Returns (total_weight, {agent_id: agent_weight}) for use in the
+        UCB exploration bonus. Without half-life, this is equivalent to
+        (total_calls, {agent: calls_for_agent}). With half-life, recent
+        calls weigh more so stale agents become "exploration-worthy"
+        again over time.
+        """
+        if not half_life_calls or half_life_calls <= 0:
+            total = self.total_calls()
+            cur = self._conn.execute(
+                "SELECT agent_id, COUNT(*) FROM invocations GROUP BY agent_id"
+            )
+            return float(total), {row[0]: float(row[1]) for row in cur}
+
+        from collections import defaultdict
+        current_tick = self._current_tick()
+        per_agent = defaultdict(float)
+        total = 0.0
+        for agent_id, entry_id in self._conn.execute(
+            "SELECT agent_id, id FROM invocations"
+        ):
+            w = self._decay_weight(int(entry_id), current_tick, half_life_calls)
+            per_agent[agent_id] += w
+            total += w
+        return total, dict(per_agent)
+
+    def compute_metrics(
+        self,
+        agent_id: str,
+        half_life_calls: Optional[float] = None,
+    ) -> Dict[str, float]:
         """
         Compute metrics from logs. If no logs exist, return the config's
         cold-start prior for the agent.
+
+        With half_life_calls, log entries are exponentially down-weighted
+        by age (measured in invocation counts, not wall-clock time). This
+        is the standard adaptation for non-stationary bandits: an agent
+        that was great last year and broken this year stops looking great.
         """
         rows = self._conn.execute(
             """
-            SELECT success, quality_score, latency_ms
+            SELECT id, success, quality_score, latency_ms
             FROM invocations
             WHERE agent_id = ?
             """,
@@ -128,20 +179,34 @@ class LogStore:
         if not rows:
             return self._default_for(agent_id)
 
-        n = len(rows)
-        successes = sum(int(r["success"]) for r in rows)
-        failures = n - successes
-        avg_quality = sum(float(r["quality_score"]) for r in rows) / n
-        avg_latency = sum(int(r["latency_ms"]) for r in rows) / n
+        if half_life_calls and half_life_calls > 0:
+            current_tick = self._current_tick()
+            weights = [
+                self._decay_weight(int(r["id"]), current_tick, half_life_calls)
+                for r in rows
+            ]
+        else:
+            weights = [1.0] * len(rows)
 
+        wsum = sum(weights)
+        if wsum <= 0:
+            # All entries decayed to zero (shouldn't happen with sane
+            # half-life, but be defensive). Fall back to the prior.
+            return self._default_for(agent_id)
+
+        successes = sum(w * int(r["success"]) for w, r in zip(weights, rows))
+        avg_quality = sum(w * float(r["quality_score"]) for w, r in zip(weights, rows)) / wsum
+        avg_latency = sum(w * int(r["latency_ms"]) for w, r in zip(weights, rows)) / wsum
+
+        success_rate = successes / wsum
         # Normalize latency to 1 = fast, 0 = slow (3s cutoff).
         latency_score = 1.0 - min(avg_latency / 3000.0, 1.0)
 
         return {
-            "success_rate": successes / n,
+            "success_rate": success_rate,
             "quality_score": avg_quality,
             "latency_score": latency_score,
-            "failure_rate": failures / n,
+            "failure_rate": 1.0 - success_rate,
         }
 
     # ---- helpers -----------------------------------------------------------

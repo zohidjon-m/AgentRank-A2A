@@ -54,8 +54,6 @@ def build_strategies(scenario: Scenario, config: ScoringConfig, seed: int):
             candidates=scenario.candidates(), priors=scenario.priors,
         ),
     ]
-    # Add a judged variant whenever the scenario explicitly opts in
-    # (i.e. when there's a meaningful difference between claim and truth).
     if scenario.enable_judge_variant:
         strategies.append(
             AgentRankStrategy(
@@ -63,6 +61,18 @@ def build_strategies(scenario: Scenario, config: ScoringConfig, seed: int):
                 candidates=scenario.candidates(), priors=scenario.priors,
                 judge=OracleJudge(),
                 variant_suffix="_judged",
+            )
+        )
+    if scenario.enable_decay_variant_half_life is not None:
+        decayed_cfg = config.with_drift_half_life(
+            "nlp/summarize",
+            scenario.enable_decay_variant_half_life,
+        )
+        strategies.append(
+            AgentRankStrategy(
+                decayed_cfg, domain="nlp", task_type="summarize",
+                candidates=scenario.candidates(), priors=scenario.priors,
+                variant_suffix="_decayed",
             )
         )
     return strategies
@@ -75,7 +85,9 @@ def run_scenario(
     n_trials: int,
 ) -> Dict[str, Any]:
     """Run all strategies on a scenario across n_trials seeds and average."""
-    oracle = scenario.oracle_reward_per_call()
+    # Oracle is per-step so drift scenarios are scored honestly.
+    oracle_per_step = [scenario.oracle_reward_at_step(t) for t in range(n_steps)]
+    oracle_mean = sum(oracle_per_step) / n_steps if n_steps else 0.0
     per_strategy: Dict[str, Dict[str, Any]] = {}
 
     # We accumulate regret curves across trials, then average pointwise.
@@ -87,8 +99,8 @@ def run_scenario(
         strategies = build_strategies(scenario, config, seed)
         for strat in strategies:
             history = run_trial(strat, scenario, n_steps, seed=seed)
-            regret_curve = cumulative_regret(history, oracle)
-            summary = final_summary(history, oracle)
+            regret_curve = cumulative_regret(history, oracle_per_step)
+            summary = final_summary(history, oracle_per_step)
 
             regret_accumulators.setdefault(strat.name, []).append(regret_curve)
             summaries.setdefault(strat.name, []).append(summary)
@@ -114,7 +126,8 @@ def run_scenario(
         "scenario": scenario.name,
         "description": scenario.description,
         "oracle_agent": scenario.oracle_agent(),
-        "oracle_reward_per_call": oracle,
+        "oracle_reward_per_call": oracle_mean,
+        "drift_at": scenario.drift_at,
         "n_steps": n_steps,
         "n_trials": n_trials,
         "strategies": per_strategy,
@@ -163,9 +176,10 @@ def print_summary(results: List[Dict[str, Any]]) -> None:
         print("=" * 70)
         print(f"Scenario: {r['scenario']}")
         print(f"  {r['description']}")
+        drift_note = f" | drift_at={r['drift_at']}" if r.get("drift_at") is not None else ""
         print(
-            f"  Oracle: {r['oracle_agent']} "
-            f"(E[reward/call] = {r['oracle_reward_per_call']:.4f})"
+            f"  Oracle (step 0): {r['oracle_agent']} "
+            f"(avg E[reward/call] = {r['oracle_reward_per_call']:.4f}){drift_note}"
         )
         print(f"  Settings: {r['n_steps']} steps, {r['n_trials']} trials")
         print("-" * 70)

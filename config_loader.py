@@ -11,7 +11,7 @@ applied — used by the eval harness to compose per-scenario views.
 
 import copy
 import json
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 
 _NEUTRAL_DEFAULT = {
@@ -29,6 +29,10 @@ _DEFAULT_POLICY = {
         "failure_rate": -0.1,
     },
     "exploration": {"alpha": 0.5},
+    # Concept-drift handling. half_life_calls = N means a log entry's
+    # weight halves every N invocations. None / 0 disables decay
+    # (flat averaging over all history — the original behavior).
+    "drift": {"half_life_calls": None},
 }
 
 
@@ -61,7 +65,8 @@ class ScoringConfig:
         # Defensive fill so callers always see all keys.
         weights = {**_DEFAULT_POLICY["weights"], **policy.get("weights", {})}
         exploration = {**_DEFAULT_POLICY["exploration"], **policy.get("exploration", {})}
-        return {"weights": weights, "exploration": exploration}
+        drift = {**_DEFAULT_POLICY["drift"], **policy.get("drift", {})}
+        return {"weights": weights, "exploration": exploration, "drift": drift}
 
     # ---- agent priors ------------------------------------------------------
 
@@ -108,4 +113,22 @@ class ScoringConfig:
         new_raw = copy.deepcopy(self._raw)
         new_raw.setdefault("registry", {})
         new_raw["registry"][domain_key] = list(agents)
+        return ScoringConfig(new_raw)
+
+    def with_drift_half_life(
+        self,
+        domain_key: str,
+        half_life_calls: Optional[float],
+    ) -> "ScoringConfig":
+        """Return a clone with concept-drift half-life set for one domain."""
+        new_raw = copy.deepcopy(self._raw)
+        scoring = new_raw.setdefault("scoring", {})
+        domains = scoring.setdefault("domains", {})
+        # Inherit from default policy if this domain isn't defined yet.
+        if domain_key not in domains:
+            domains[domain_key] = copy.deepcopy(
+                scoring.get("default", _DEFAULT_POLICY)
+            )
+        domains[domain_key].setdefault("drift", {})
+        domains[domain_key]["drift"]["half_life_calls"] = half_life_calls
         return ScoringConfig(new_raw)

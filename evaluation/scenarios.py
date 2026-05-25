@@ -11,7 +11,7 @@ By varying the relationship between truth and priors we can isolate
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from .simulator import TruthSpec
 
@@ -34,15 +34,33 @@ class Scenario:
     weights: Dict[str, float] = field(default_factory=lambda: dict(SUMMARIZE_WEIGHTS))
     # Hint for run_eval: enable the judged AgentRank variant on this scenario.
     enable_judge_variant: bool = False
+    # Concept-drift: at step `drift_at`, replace `agents` with `drift_agents`.
+    # Both should describe the same agent_ids — only their behavior changes.
+    drift_at: Optional[int] = None
+    drift_agents: Optional[List[TruthSpec]] = None
+    # When set, run_eval registers an AgentRank variant with this half-life.
+    enable_decay_variant_half_life: Optional[float] = None
 
     def candidates(self) -> List[str]:
         return [a.agent_id for a in self.agents]
 
+    def specs_at_step(self, t: int) -> List[TruthSpec]:
+        """Returns the active TruthSpec list at logical step t."""
+        if self.drift_at is not None and t >= self.drift_at and self.drift_agents:
+            return self.drift_agents
+        return self.agents
+
+    def oracle_reward_at_step(self, t: int) -> float:
+        """Best achievable expected reward at step t (post-drift if applicable)."""
+        specs = self.specs_at_step(t)
+        return max(s.expected_reward(self.weights) for s in specs)
+
     def oracle_agent(self) -> str:
-        """The agent with the highest *true* expected reward."""
+        """The agent with the highest true expected reward at step 0."""
         return max(self.agents, key=lambda a: a.expected_reward(self.weights)).agent_id
 
     def oracle_reward_per_call(self) -> float:
+        """Step-0 oracle reward. For drift scenarios use oracle_reward_at_step."""
         return max(a.expected_reward(self.weights) for a in self.agents)
 
 
@@ -156,4 +174,58 @@ SCENARIO_LYING_AGENT = Scenario(
 )
 
 
-ALL_SCENARIOS = [SCENARIO_PRIORS_CORRECT, SCENARIO_HIDDEN_GEM, SCENARIO_LYING_AGENT]
+# ---------------------------------------------------------------------------
+# Scenario D: concept drift.
+#
+# SummarizerQuality is the best agent until step 150. After step 150 it
+# silently degrades (e.g. an upstream model rollback) while SummarizerFast
+# improves. Strategies that aggregate over all history will keep favoring
+# the now-broken SummarizerQuality. The AgentRank variant with exponential
+# decay (half_life_calls=40) should rapidly forget the pre-drift logs and
+# switch to SummarizerFast.
+# ---------------------------------------------------------------------------
+SCENARIO_CONCEPT_DRIFT = Scenario(
+    name="concept_drift",
+    description=(
+        "SummarizerQuality is best for the first 150 calls, then silently "
+        "degrades while SummarizerFast improves. Strategies that average "
+        "over all history stay stuck on the now-broken SummarizerQuality. "
+        "AgentRank with exponential decay should detect the switch."
+    ),
+    agents=[
+        TruthSpec("SummarizerFast", success_prob=1.00, quality_mean=0.50,
+                  latency_min_ms=80, latency_max_ms=120),
+        TruthSpec("SummarizerQuality", success_prob=1.00, quality_mean=0.90,
+                  latency_min_ms=700, latency_max_ms=900),
+        TruthSpec("SummarizerHallucinator", success_prob=0.70, quality_mean=0.20,
+                  latency_min_ms=200, latency_max_ms=1200),
+    ],
+    priors={
+        "SummarizerFast": {"success_rate": 0.95, "quality_score": 0.5,
+                           "latency_score": 0.9, "failure_rate": 0.05},
+        "SummarizerQuality": {"success_rate": 0.98, "quality_score": 0.9,
+                              "latency_score": 0.7, "failure_rate": 0.02},
+        "SummarizerHallucinator": {"success_rate": 0.7, "quality_score": 0.2,
+                                   "latency_score": 0.6, "failure_rate": 0.3},
+    },
+    drift_at=150,
+    drift_agents=[
+        # SummarizerFast: model upgraded; now high-quality.
+        TruthSpec("SummarizerFast", success_prob=1.00, quality_mean=0.85,
+                  latency_min_ms=80, latency_max_ms=120),
+        # SummarizerQuality: rolled back to a broken model.
+        TruthSpec("SummarizerQuality", success_prob=0.80, quality_mean=0.25,
+                  latency_min_ms=700, latency_max_ms=900),
+        TruthSpec("SummarizerHallucinator", success_prob=0.70, quality_mean=0.20,
+                  latency_min_ms=200, latency_max_ms=1200),
+    ],
+    enable_decay_variant_half_life=40.0,
+)
+
+
+ALL_SCENARIOS = [
+    SCENARIO_PRIORS_CORRECT,
+    SCENARIO_HIDDEN_GEM,
+    SCENARIO_LYING_AGENT,
+    SCENARIO_CONCEPT_DRIFT,
+]

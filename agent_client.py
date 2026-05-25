@@ -38,7 +38,7 @@ class AgentClient:
             print(
                 f"  - {r['agent_id']:24s} | score={r['score']:.3f} "
                 f"(base={r['base_score']:.3f} +explore={r['exploration_bonus']:.3f}) "
-                f"| n={r['n_a']:<3d} "
+                f"| n={r['n_a']:>5.1f} "
                 f"| SR={m['success_rate']:.2f} QS={m['quality_score']:.2f} "
                 f"LS={m['latency_score']:.2f} FR={m['failure_rate']:.2f}"
             )

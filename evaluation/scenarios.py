@@ -32,6 +32,8 @@ class Scenario:
     agents: List[TruthSpec]
     priors: Dict[str, Dict[str, float]]
     weights: Dict[str, float] = field(default_factory=lambda: dict(SUMMARIZE_WEIGHTS))
+    # Hint for run_eval: enable the judged AgentRank variant on this scenario.
+    enable_judge_variant: bool = False
 
     def candidates(self) -> List[str]:
         return [a.agent_id for a in self.agents]
@@ -85,8 +87,6 @@ SCENARIO_PRIORS_CORRECT = Scenario(
 # previously-favored agent has been over-rated. Greedy is *stuck* on the
 # over-rated agent forever; AgentRank should explore, discover the gem,
 # and converge to it.
-#
-# This is the scenario that justifies AgentRank's existence.
 # ---------------------------------------------------------------------------
 SCENARIO_HIDDEN_GEM = Scenario(
     name="hidden_gem",
@@ -97,16 +97,13 @@ SCENARIO_HIDDEN_GEM = Scenario(
         "this; AgentRank should."
     ),
     agents=[
-        # SummarizerFast: now actually high quality, still fast.
         TruthSpec("SummarizerFast", success_prob=1.00, quality_mean=0.85,
                   latency_min_ms=80, latency_max_ms=120),
-        # SummarizerQuality: degraded — still claims 0.9 in prior but truly 0.55.
         TruthSpec("SummarizerQuality", success_prob=0.90, quality_mean=0.55,
                   latency_min_ms=700, latency_max_ms=900),
         TruthSpec("SummarizerHallucinator", success_prob=0.70, quality_mean=0.20,
                   latency_min_ms=200, latency_max_ms=1200),
     ],
-    # Stale priors from the old reality.
     priors={
         "SummarizerFast": {"success_rate": 0.95, "quality_score": 0.5,
                            "latency_score": 0.9, "failure_rate": 0.05},
@@ -118,4 +115,45 @@ SCENARIO_HIDDEN_GEM = Scenario(
 )
 
 
-ALL_SCENARIOS = [SCENARIO_PRIORS_CORRECT, SCENARIO_HIDDEN_GEM]
+# ---------------------------------------------------------------------------
+# Scenario C: a lying agent.
+#
+# SummarizerLiar self-reports quality 0.95 on every call but actually
+# delivers 0.20. Without an external judge, every strategy that learns
+# from observed quality (AgentRank, epsilon-greedy) is fooled and
+# over-selects the liar. With OracleJudge, AgentRank sees the truth and
+# steers clear.
+#
+# This is the threat model the LLM-as-judge stage is designed to address.
+# ---------------------------------------------------------------------------
+SCENARIO_LYING_AGENT = Scenario(
+    name="lying_agent",
+    description=(
+        "SummarizerLiar self-reports quality 0.95 but delivers 0.20. "
+        "Without a judge, strategies that learn from observed (claimed) "
+        "quality get fooled. AgentRank + OracleJudge ignores the claim "
+        "and selects the genuinely-best agent."
+    ),
+    agents=[
+        TruthSpec("SummarizerFast", success_prob=1.00, quality_mean=0.50,
+                  latency_min_ms=80, latency_max_ms=120),
+        TruthSpec("SummarizerQuality", success_prob=1.00, quality_mean=0.90,
+                  latency_min_ms=700, latency_max_ms=900),
+        TruthSpec("SummarizerLiar", success_prob=1.00,
+                  quality_mean=0.20, claimed_quality_mean=0.95,
+                  latency_min_ms=100, latency_max_ms=200),
+    ],
+    priors={
+        "SummarizerFast": {"success_rate": 0.95, "quality_score": 0.5,
+                           "latency_score": 0.9, "failure_rate": 0.05},
+        "SummarizerQuality": {"success_rate": 0.98, "quality_score": 0.9,
+                              "latency_score": 0.7, "failure_rate": 0.02},
+        # Liar advertises an attractive prior matching its (false) claim.
+        "SummarizerLiar": {"success_rate": 1.00, "quality_score": 0.95,
+                           "latency_score": 0.9, "failure_rate": 0.0},
+    },
+    enable_judge_variant=True,
+)
+
+
+ALL_SCENARIOS = [SCENARIO_PRIORS_CORRECT, SCENARIO_HIDDEN_GEM, SCENARIO_LYING_AGENT]

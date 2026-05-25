@@ -4,8 +4,12 @@ Configuration loader for AgentRank.
 Centralizes scoring weights, exploration parameters, agent priors,
 and the agent registry. All knobs live in config/scoring.json so the
 scoring policy is data-driven rather than hardcoded.
+
+`with_priors` / `with_registry` return cloned configs with overrides
+applied — used by the eval harness to compose per-scenario views.
 """
 
+import copy
 import json
 from typing import Dict, Any, List, Tuple
 
@@ -89,3 +93,19 @@ class ScoringConfig:
 
     def db_path(self) -> str:
         return self._raw.get("persistence", {}).get("db_path", "agentrank.db")
+
+    # ---- overrides (for eval / tests) --------------------------------------
+
+    def with_priors(self, priors: Dict[str, Dict[str, float]]) -> "ScoringConfig":
+        """Return a clone with additional / overridden agent priors."""
+        new_raw = copy.deepcopy(self._raw)
+        new_raw.setdefault("agent_defaults", {})
+        new_raw["agent_defaults"].update(priors)
+        return ScoringConfig(new_raw)
+
+    def with_registry(self, domain_key: str, agents: List[str]) -> "ScoringConfig":
+        """Return a clone with the registry entry for domain_key replaced."""
+        new_raw = copy.deepcopy(self._raw)
+        new_raw.setdefault("registry", {})
+        new_raw["registry"][domain_key] = list(agents)
+        return ScoringConfig(new_raw)

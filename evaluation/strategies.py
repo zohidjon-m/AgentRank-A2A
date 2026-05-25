@@ -8,7 +8,6 @@ Each strategy implements the same minimal interface:
 So the runner can swap them in and out without knowing internals.
 """
 
-import math
 import random
 from typing import List, Dict, Any, Optional
 
@@ -16,6 +15,7 @@ from log_store import LogStore
 from domain_registry import DomainRegistry
 from agent_rank_service import AgentRankService
 from config_loader import ScoringConfig
+from judge import QualityJudge
 
 
 class Strategy:
@@ -88,6 +88,10 @@ class EpsilonGreedyStrategy(Strategy):
     Picks the best observed agent (by empirical reward) with probability
     1-epsilon, otherwise picks uniformly at random. Classic exploration
     baseline to compare UCB against.
+
+    Note: epsilon-greedy uses the *claimed* quality from the outcome
+    (same as AgentRank without a judge). If a lying agent is in the
+    mix, this baseline will be fooled too.
     """
     name = "epsilon_greedy"
 
@@ -110,34 +114,77 @@ class EpsilonGreedyStrategy(Strategy):
         return max(candidates, key=self._mean_reward)
 
     def update(self, agent_id: str, outcome: Dict[str, Any]) -> None:
-        from .simulator import call_reward
-        # epsilon-greedy needs the reward, not the raw outcome; we recompute it.
-        r = call_reward(outcome, self._weights)
-        self._reward_sum[agent_id] += r
+        # epsilon-greedy learns from what the agent *claims*, not the truth.
+        # We reconstruct reward from the claimed quality_score, not the true one.
+        weights = self._weights
+        s = int(outcome["success"])
+        q = float(outcome["quality_score"])  # CLAIMED — that's the realistic case
+        latency_score = 1.0 - min(float(outcome["latency_ms"]) / 3000.0, 1.0)
+        observed_reward = (
+            weights["success_rate"] * s
+            + weights["quality_score"] * q
+            + weights["latency_score"] * latency_score
+            + weights["failure_rate"] * (1 - s)
+        )
+        self._reward_sum[agent_id] += observed_reward
         self._counts[agent_id] += 1
 
 
 class AgentRankStrategy(Strategy):
     """
     The real AgentRank service running on an in-memory SQLite log store.
-    This is the strategy we're trying to validate.
+
+    When `judge` is supplied, the judge's score replaces the agent's
+    self-reported quality_score before logging. In eval, pair this with
+    OracleJudge — the simulator emits both claimed and true quality on
+    each call, and OracleJudge returns the true value via the `hint`
+    argument. This isolates the judge's *contribution* to the ranker.
     """
     name = "agent_rank"
 
-    def __init__(self, config: ScoringConfig, domain: str, task_type: str):
-        self._log_store = LogStore(db_path=":memory:", config=config)
-        registry = DomainRegistry(config)
-        self._service = AgentRankService(self._log_store, registry, config)
+    def __init__(
+        self,
+        base_config: ScoringConfig,
+        domain: str,
+        task_type: str,
+        candidates: List[str],
+        priors: Dict[str, Dict[str, float]],
+        judge: Optional[QualityJudge] = None,
+        variant_suffix: str = "",
+    ):
+        # Compose a per-scenario config view so the strategy sees the
+        # scenario's priors and registry without touching the global config.
+        cfg = base_config.with_priors(priors).with_registry(
+            f"{domain}/{task_type}", candidates
+        )
+        self._log_store = LogStore(db_path=":memory:", config=cfg)
+        registry = DomainRegistry(cfg)
+        self._service = AgentRankService(self._log_store, registry, cfg)
         self._domain = domain
         self._task_type = task_type
+        self._judge = judge
+        if variant_suffix:
+            self.name = f"agent_rank{variant_suffix}"
 
     def select(self, candidates: List[str]) -> str:
-        # Note: AgentRank uses its own registry; we trust it matches candidates.
         ranking = self._service.rank(self._domain, self._task_type, "")
         return ranking[0]["agent_id"]
 
     def update(self, agent_id: str, outcome: Dict[str, Any]) -> None:
-        # Outcome already has agent_id set by the simulator.
+        # Defensive copy so we don't mutate the simulator's outcome dict
+        # (other strategies in the same trial share the same record... actually
+        # they don't — runner.py samples fresh per strategy — but copying is cheap).
+        outcome = dict(outcome)
+        if self._judge is not None and outcome.get("success"):
+            verdict = self._judge.score(
+                payload="",
+                output={},
+                hint=outcome.get("true_quality_score"),
+            )
+            outcome["agent_claimed_quality"] = outcome["quality_score"]
+            outcome["quality_score"] = verdict.score
+            outcome["judge_name"] = verdict.judge_name
+            outcome["judge_reason"] = verdict.reason
         self._log_store.record_invocation(outcome)
 
     def close(self) -> None:

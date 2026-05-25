@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from config_loader import ScoringConfig
+from judge import OracleJudge
 from evaluation.scenarios import ALL_SCENARIOS, Scenario
 from evaluation.strategies import (
     RandomStrategy,
@@ -43,13 +44,28 @@ def build_strategies(scenario: Scenario, config: ScoringConfig, seed: int):
     """Fresh strategy instances for one trial."""
     rng_a = random.Random(seed + 1000)
     rng_b = random.Random(seed + 2000)
-    return [
+    strategies = [
         RandomStrategy(rng_a),
         RoundRobinStrategy(),
         GreedyPriorStrategy(scenario.priors, scenario.weights),
         EpsilonGreedyStrategy(scenario.weights, rng_b, epsilon=0.1),
-        AgentRankStrategy(config, domain="nlp", task_type="summarize"),
+        AgentRankStrategy(
+            config, domain="nlp", task_type="summarize",
+            candidates=scenario.candidates(), priors=scenario.priors,
+        ),
     ]
+    # Add a judged variant whenever the scenario explicitly opts in
+    # (i.e. when there's a meaningful difference between claim and truth).
+    if scenario.enable_judge_variant:
+        strategies.append(
+            AgentRankStrategy(
+                config, domain="nlp", task_type="summarize",
+                candidates=scenario.candidates(), priors=scenario.priors,
+                judge=OracleJudge(),
+                variant_suffix="_judged",
+            )
+        )
+    return strategies
 
 
 def run_scenario(
@@ -129,7 +145,7 @@ def write_plots(results: List[Dict[str, Any]], out_dir: Path) -> bool:
         fig, ax = plt.subplots(figsize=(8, 5))
         for name, data in r["strategies"].items():
             ax.plot(data["avg_regret_curve"], label=name, linewidth=1.5)
-        ax.set_title(f"Cumulative regret — scenario: {r['scenario']}")
+        ax.set_title(f"Cumulative regret - scenario: {r['scenario']}")
         ax.set_xlabel("Step")
         ax.set_ylabel("Cumulative regret (lower is better)")
         ax.legend()
@@ -153,7 +169,7 @@ def print_summary(results: List[Dict[str, Any]]) -> None:
         )
         print(f"  Settings: {r['n_steps']} steps, {r['n_trials']} trials")
         print("-" * 70)
-        header = f"  {'strategy':<18} {'final_regret':>14} {'+/-stdev':>10} {'avg_reward':>12}"
+        header = f"  {'strategy':<22} {'final_regret':>14} {'+/-stdev':>10} {'avg_reward':>12}"
         print(header)
         # Sort by final regret (lower = better).
         ranked = sorted(
@@ -162,7 +178,7 @@ def print_summary(results: List[Dict[str, Any]]) -> None:
         )
         for name, data in ranked:
             print(
-                f"  {name:<18} "
+                f"  {name:<22} "
                 f"{data['final_regret_mean']:>14.3f} "
                 f"{data['final_regret_stdev']:>10.3f} "
                 f"{data['avg_reward_per_call']:>12.4f}"
@@ -171,7 +187,7 @@ def print_summary(results: List[Dict[str, Any]]) -> None:
         for name, data in ranked:
             shares = data["selection_share_mean"]
             share_str = "  ".join(f"{a}={p:.0%}" for a, p in shares.items())
-            print(f"    {name:<18} {share_str}")
+            print(f"    {name:<22} {share_str}")
 
 
 def main():
@@ -200,8 +216,6 @@ def main():
 
     # Write JSON.
     summary_path = out_dir / "summary.json"
-    # Strip the long regret curves from the JSON summary for readability;
-    # full curves go into a separate file.
     slim = [
         {
             **{k: v for k, v in r.items() if k != "strategies"},

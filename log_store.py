@@ -5,6 +5,11 @@ Stores one row per agent invocation and computes aggregate metrics on
 demand. Cold-start priors come from the config (so adding a new agent
 no longer requires editing this file).
 
+The schema includes optional judge metadata (judge_name, judge_reason,
+agent_claimed_quality) for observability — so you can later answer
+questions like "did the judge ever disagree with the agent's
+self-report, and by how much?"
+
 The interface mirrors the previous in-memory store so callers do not
 need to change. Pass db_path=":memory:" for tests.
 """
@@ -42,13 +47,30 @@ class LogStore:
                 quality_score REAL NOT NULL,
                 latency_ms INTEGER NOT NULL,
                 failure_reason TEXT,
-                timestamp REAL NOT NULL
+                timestamp REAL NOT NULL,
+                judge_name TEXT,
+                judge_reason TEXT,
+                agent_claimed_quality REAL
             )
             """
         )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_invocations_agent ON invocations(agent_id)"
         )
+
+        # Best-effort migration for databases created before the judge
+        # columns existed. ALTER TABLE ... ADD COLUMN is idempotent in
+        # SQLite only if we guard against duplicate-column errors.
+        for col, decl in [
+            ("judge_name", "TEXT"),
+            ("judge_reason", "TEXT"),
+            ("agent_claimed_quality", "REAL"),
+        ]:
+            try:
+                self._conn.execute(f"ALTER TABLE invocations ADD COLUMN {col} {decl}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
         self._conn.commit()
 
     # ---- writes ------------------------------------------------------------
@@ -58,8 +80,9 @@ class LogStore:
             """
             INSERT INTO invocations
                 (agent_id, success, quality_score, latency_ms,
-                 failure_reason, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)
+                 failure_reason, timestamp,
+                 judge_name, judge_reason, agent_claimed_quality)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 metrics["agent_id"],
@@ -68,6 +91,9 @@ class LogStore:
                 int(metrics["latency_ms"]),
                 metrics.get("failure_reason"),
                 time.time(),
+                metrics.get("judge_name"),
+                metrics.get("judge_reason"),
+                metrics.get("agent_claimed_quality"),
             ),
         )
         self._conn.commit()

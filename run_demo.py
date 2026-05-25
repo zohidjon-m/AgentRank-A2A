@@ -4,13 +4,31 @@ Entry point for the AgentRank demo.
 Wires together: config -> persistent log store -> registry ->
 rank service -> client. Each invocation prints the full ranking
 breakdown so you can watch the UCB bonus shift selections over time.
+
+The MockHeuristicJudge is wired in by default. It rescores the agent's
+output using length + word-overlap heuristics, which catches the
+hallucinator's invented facts even when it claims success. Swap in
+AnthropicJudge once you have ANTHROPIC_API_KEY set.
 """
+
+import os
 
 from config_loader import ScoringConfig
 from log_store import LogStore
 from domain_registry import DomainRegistry
 from agent_rank_service import AgentRankService
 from agent_client import AgentClient
+from judge import MockHeuristicJudge, AnthropicJudge
+
+
+def build_judge():
+    """Use the Anthropic judge if a key is set, otherwise fall back to the mock."""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        try:
+            return AnthropicJudge()
+        except (ImportError, RuntimeError) as e:
+            print(f"[demo] AnthropicJudge unavailable ({e}); using MockHeuristicJudge")
+    return MockHeuristicJudge()
 
 
 def main():
@@ -18,11 +36,13 @@ def main():
     logs = LogStore(db_path=config.db_path(), config=config)
     registry = DomainRegistry(config)
     rank_service = AgentRankService(logs, registry, config)
-    client = AgentClient(rank_service)
+    judge = build_judge()
+    client = AgentClient(rank_service, judge=judge)
 
     print("=== AgentRank + A2A Demo (Summarization Domain) ===")
     print("Agents: SummarizerFast, SummarizerQuality, SummarizerHallucinator")
     print(f"Persistence: {config.db_path()} | prior invocations: {logs.total_calls()}")
+    print(f"Judge: {judge.name}")
 
     try:
         while True:

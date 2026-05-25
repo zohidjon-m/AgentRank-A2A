@@ -1,0 +1,9 @@
+# Required for LinUCB contextual bandit (matrix operations).
+numpy>=1.24
+
+# Optional, used by evaluation/run_eval.py for plotting regret curves.
+# The eval still works without this — it just skips PNG output.
+matplotlib>=3.5
+
+# Optional, used by judge.AnthropicJudge when ANTHROPIC_API_KEY is set.
+# anthropic>=0.40

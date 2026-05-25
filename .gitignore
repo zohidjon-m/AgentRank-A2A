@@ -3,3 +3,10 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
+
+# AgentRank persistence
+*.db
+*.db-journal
+
+# Evaluation outputs (regenerable; run `python -m evaluation.run_eval`)
+evaluation/results/

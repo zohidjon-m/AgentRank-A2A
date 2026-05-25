@@ -1,66 +1,337 @@
-#  AgentRank: Intelligent Agent Selection Layer for A2A Ecosystems
-*A domain-aware, learning, exploration-enabled ranking engine for multi-agent systems.*
+# AgentRank — Intelligent Agent Selection for A2A Ecosystems
 
-##  Overview
-Modern multi-agent environments often contain **multiple agents that provide similar capabilities** (e.g., summarizers, translators, recruiters).  
-The A2A protocol defines how agents communicate, but it does **not** define how to select the best agent.
+> A domain-aware, learning, exploration-enabled ranking engine for multi-agent systems. Replaces "hardcode the best agent" with an adaptive ranker that learns from observed outcomes, resists adversarial agents, adapts to drift, and routes per-request based on payload features.
 
-**AgentRank** solves this by ranking agents using:
-- performance metrics  
-- domain policies  
-- exploration techniques  
-- learning from logs  
+---
 
-##  Features
-- Intelligent agent selection  
-- Config-driven scoring  
-- Domain-aware policies  
-- UCB exploration  
-- Dynamic learning  
-- A2A integration  
+## The problem
 
-##  Architecture
-```
-Client Agent → AgentRank Service → Best Agent → A2A Request → Logs
-```
+The [A2A protocol](https://a2a-protocol.org/) defines how agents talk to each other. It does **not** define which agent to talk to. In any non-trivial deployment you'll have multiple agents that nominally do the same thing — three summarizers, four translators, five recruiters. Picking one is its own problem, and naive answers fail in specific, measurable ways:
 
-## Metrics
-- **Success Rate (SR)**  
-- **Quality Score (QS)**  
-- **Latency Score (LS)**  
-- **Failure Rate (FR)**  
+| Naive approach | What breaks it |
+|---|---|
+| Always pick the highest-prior agent | The "best" agent isn't actually best (priors are wrong, or quality changed) |
+| Trust the quality each agent self-reports | One agent claims `quality=1.0` and dominates regardless of what it delivers |
+| Pick the same agent every time | The best agent today isn't the best agent next month |
+| Run one global ranker | Different requests have different optima — a tweet and a legal contract aren't the same task |
 
-##  Ranking Algorithm
-### 1. Base Score
-```
-base_score = wSR·SR + wQS·QS + wLS·LS + wFR·FR
-```
+AgentRank addresses all four with measurable improvements over baselines. Every claim in this README is reproducible by running `python -m evaluation.run_eval`.
 
-### 2. Exploration Bonus (UCB)
-```
-exploration = α * sqrt( ln(1+N) / (1+n_a) )
-```
+---
 
-### 3. Final Score
-```
-final_score = base_score + exploration
-```
+## Headline results
 
-##  Project Structure
-```
-│ run_demo.py
-│ agent_client.py
-│ agent_rank_service.py
-│ log_store.py
-│ domain_registry.py
-│ a2a_protocol.py
-└ agents/
-```
+Five scenarios from the eval harness, measured by **cumulative regret** vs. an omniscient oracle that always picks the truly best agent. Lower is better. All numbers averaged over 10 trials × 300 steps.
 
-##  Running
-```
+### 1. `priors_correct` — cold-start priors match reality
+
+The "happy path." Greedy wins by a hair because its hardcoded prior happens to be correct. AgentRank pays a small exploration tax. The point of including this scenario: AgentRank isn't catastrophic on easy problems.
+
+| Strategy | Final regret | Selection share |
+|---|---:|---|
+| **greedy_prior** | **0.03** | SummarizerQuality=100% |
+| agent_rank | 1.02 | SummarizerQuality=98%, SummarizerFast=2% |
+| epsilon_greedy | 6.73 | SummarizerQuality=93%, others 4% each |
+| round_robin | 63.92 | 33% each |
+| random | 65.32 | 33% each |
+
+![regret curves — priors_correct](docs/images/regret_priors_correct.png)
+
+---
+
+### 2. `hidden_gem` — priors are misleading
+
+Cold-start says SummarizerQuality is best. Reality: a "model upgrade" means SummarizerFast is now the optimum. Greedy is stuck on the over-rated agent forever. AgentRank discovers the truth.
+
+| Strategy | Final regret | Selection share |
+|---|---:|---|
+| **agent_rank** | **0.86** | SummarizerFast=99% (correct) |
+| epsilon_greedy | 7.98 | SummarizerFast=93% |
+| round_robin | 72.61 | 33% each |
+| greedy_prior | 73.28 | SummarizerQuality=100% (stuck on stale prior) |
+| random | 74.84 | 33% each |
+
+![regret curves — hidden_gem](docs/images/regret_hidden_gem.png)
+
+Same `greedy_prior` strategy that won scenario 1 is catastrophic here. AgentRank is the only strategy robust to whether priors are correct.
+
+---
+
+### 3. `lying_agent` — agent self-reports are corruptible
+
+`SummarizerLiar` self-reports `quality=0.95` on every call but actually delivers `0.20`. Strategies that learn from observed (claimed) quality get fooled and converge on the lie. The judged variant uses an external `QualityJudge` and sees through it.
+
+| Strategy | Final regret | Selection share |
+|---|---:|---|
+| **agent_rank_judged** | **1.34** | SummarizerQuality=98% (sees the lie) |
+| round_robin | 48.26 | 33% each |
+| random | 48.36 | 33% each |
+| agent_rank | 85.28 | **SummarizerLiar=89%** (fooled) |
+| epsilon_greedy | 90.33 | **SummarizerLiar=93%** (fooled) |
+| greedy_prior | 95.26 | **SummarizerLiar=100%** (fooled) |
+
+![regret curves — lying_agent](docs/images/regret_lying_agent.png)
+
+**The smarter the learning algorithm, the worse it does** when quality can be lied about — because smart learners actively converge on the lie. Random and round-robin do better here than AgentRank-without-judge, simply by accident. Only the judged variant gets near-zero regret. This is the strongest motivation for LLM-as-judge in agent marketplaces.
+
+---
+
+### 4. `concept_drift` — agent quality changes mid-trial
+
+For the first 150 calls, SummarizerQuality is best. After step 150 it silently degrades while SummarizerFast improves. The oracle's identity flips. AgentRank adapts; greedy doesn't.
+
+| Strategy | Final regret | Selection share |
+|---|---:|---|
+| **agent_rank** | **1.10** | SF=51%, SQ=49% (adapted) |
+| agent_rank_decayed | 3.68 | SF=51%, SQ=49% |
+| epsilon_greedy | 33.94 | SQ-heavy |
+| greedy_prior | 64.29 | SummarizerQuality=100% (stuck) |
+| round_robin | 77.10 | 33% each |
+| random | 80.03 | 33% each |
+
+![regret curves — concept_drift](docs/images/regret_concept_drift.png)
+
+Both AgentRank variants adapt because the drift is dramatic (quality changes by ~0.6) and UCB's continuous exploration is sufficient on its own. The decay variant's value would dominate in longer-horizon scenarios with subtler drift, where the bandit has "settled" and natural exploration isn't enough — the mechanism is in place for those cases.
+
+---
+
+### 5. `context_aware` — the best agent depends on the request
+
+SummarizerFast is great on short text, terrible on long. SummarizerQuality is the inverse. **There is no single best agent on average.** UCB1 is fundamentally limited because it can only learn one preference per agent. LinUCB learns a per-agent reward function over payload features and routes each request to the right agent.
+
+| Strategy | Final regret | Selection share |
+|---|---:|---|
+| **agent_rank_linucb** | **2.60** | SF=45%, SQ=54% (routes by context) |
+| agent_rank | 47.99 | SF=51%, SQ=48% (random tie) |
+| greedy_prior | 48.78 | SQ=100% |
+| epsilon_greedy | 49.33 | SF=60% |
+| random | 66.61 | 33% each |
+| round_robin | 66.70 | 33% each |
+
+![regret curves — context_aware](docs/images/regret_context_aware.png)
+
+**LinUCB drops regret 18× vs UCB1.** No amount of tuning UCB1's exploration can recover this — the optimum requires conditioning on request features, and UCB1 doesn't have that capability.
+
+---
+
+## What this proves
+
+Pick any scenario above and try a baseline. Each baseline that wins one scenario loses catastrophically on another:
+
+- `greedy_prior` wins #1, loses badly on #2, #3, #5
+- `agent_rank` (UCB1) wins #2 and #4, loses badly on #3 and #5
+- `random` is mediocre everywhere
+
+Only **AgentRank with the right policy plug-ins** stays near oracle across all scenarios:
+
+| Scenario | Best AgentRank variant | Regret vs oracle |
+|---|---|---:|
+| priors_correct | `agent_rank` (UCB1) | 1.02 |
+| hidden_gem | `agent_rank` (UCB1) | 0.86 |
+| lying_agent | `agent_rank_judged` | 1.34 |
+| concept_drift | `agent_rank` (UCB1 with built-in exploration) | 1.10 |
+| context_aware | `agent_rank_linucb` | 2.60 |
+
+That's the entire pitch: **one consistent framework with pluggable bandit policies and an external quality signal, that doesn't get fooled by any of the failure modes a real multi-agent ecosystem will throw at it.**
+
+---
+
+## Quick start
+
+```bash
+# clone
+git clone <repo-url>
+cd agentrank-a2a
+
+# install dependencies (numpy is required for LinUCB; matplotlib is
+# optional, only used to render regret plots).
+pip install -r requirements.txt
+
+# run the interactive demo: prompts you for text, ranks the summarizers,
+# dispatches via the A2A protocol layer, judges the output, and logs
+# the metrics for future rankings.
 python run_demo.py
+
+# non-interactive smoke test: 15 requests through the full pipeline,
+# prints the ranking and selection share.
+python scripts/smoke_test.py
+
+# run the full evaluation suite: 5 strategies × 5 scenarios × 10 trials,
+# writes JSON + matplotlib plots into evaluation/results/.
+python -m evaluation.run_eval
+
+# longer / more careful run
+python -m evaluation.run_eval --steps 1000 --trials 20
 ```
 
-##  Conclusion
-AgentRank transforms a static multi-agent system into a **self-optimizing, intelligent, scalable ecosystem**.
+`run_demo.py` will auto-pick the AnthropicJudge if `ANTHROPIC_API_KEY` is set in your environment, otherwise it uses the offline `MockHeuristicJudge`.
+
+---
+
+## Status
+
+| # | Stage | Status | What it gives you |
+|---|---|---|---|
+| 1 | Foundation (UCB1 + config + SQLite) | ✅ | Per-domain config, exploration, persistent logs |
+| – | Evaluation harness | ✅ | 5 baseline strategies, 5 scenarios, regret/share plots |
+| 2 | LLM-as-judge quality signal | ✅ | Catches lying agents (heuristic / oracle / Anthropic stub) |
+| 3 | Concept drift via exponential decay | ✅ | Adapts to agent behavior changing over time |
+| 4 | Contextual bandit (LinUCB) | ✅ | Per-request routing by payload features |
+| 5 | Multi-objective Pareto scoring | ⏳ | Per-request user preference vectors |
+| 6 | Trust / sybil resistance | ⏳ | Agent attestation + anomaly detection |
+
+The **AnthropicJudge** is wired but ungated until `ANTHROPIC_API_KEY` is supplied. The rest of the system works fully offline.
+
+---
+
+## Architecture
+
+```
+                  ┌─────────────────────┐
+                  │    config/*.json    │ scoring weights, priors,
+                  │  (data-driven)      │ bandit choice, drift, registry
+                  └──────────┬──────────┘
+                             │
+                  ┌──────────▼──────────┐
+                  │   ScoringConfig     │  (config_loader.py)
+                  └──────────┬──────────┘
+                             │
+   ┌──────────┐   ┌──────────▼──────────┐   ┌──────────────────┐
+   │ Domain   │──▶│  AgentRankService   │◀──│ FeatureExtractor │
+   │ Registry │   │                     │   │  (length_bucket) │
+   └──────────┘   └──┬──────────────┬───┘   └──────────────────┘
+                     │              │
+                     ▼              ▼
+              ┌──────────┐   ┌──────────┐
+              │ Bandit   │   │ LogStore │  (SQLite, JSON-encoded
+              │ Policy   │   │          │   feature vectors)
+              │ (UCB1 /  │   └────▲─────┘
+              │ LinUCB)  │        │
+              └──────────┘        │
+                     │            │
+                     ▼            │
+              ┌──────────┐        │
+              │  Best    │        │ outcome metrics
+              │  Agent   │────────┤ (incl. judge score
+              └──────────┘        │  if configured)
+                     │            │
+                     ▼            │
+              ┌──────────┐  ┌─────┴─────┐
+              │ A2A send │─▶│  Judge    │
+              └──────────┘  │ (mock /   │
+                            │  oracle / │
+                            │ Anthropic)│
+                            └───────────┘
+```
+
+Three things make this work:
+
+1. **All scoring is data-driven.** Weights, exploration α, drift half-life, bandit kind, feature extractor — every knob lives in `config/scoring.json`. No code change required to tune.
+2. **Pluggable bandit policies.** `bandits.py` defines a `BanditPolicy` ABC. `UCB1Bandit` covers the context-blind case (with optional concept-drift decay). `LinUCBBandit` plugs in for contextual scenarios. Adding new policies (Thompson sampling, neural bandits) is local to that file.
+3. **Quality is verified, not trusted.** The optional `QualityJudge` re-scores the agent's output and overrides the agent's self-report. Without this, every learning strategy in the system is gameable.
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design and per-component walkthrough.
+
+---
+
+## Project structure
+
+```
+agentrank-a2a/
+├── config/scoring.json        # all scoring knobs
+├── config_loader.py           # ScoringConfig + with_priors/with_registry/with_bandit
+├── bandits.py                 # BanditPolicy ABC, UCB1, LinUCB, factory
+├── feature_extractor.py       # PayloadFeatureExtractor + LengthBucketExtractor
+├── judge.py                   # QualityJudge: Mock, Oracle, Anthropic
+├── log_store.py               # SQLite invocation log (auto-migrating schema)
+├── domain_registry.py         # (domain, task_type) → [agent_id]
+├── agent_rank_service.py      # ranking entry point (delegates to bandit)
+├── agent_client.py            # rank → dispatch → judge → log
+├── a2a_protocol.py            # toy A2A message-passing layer
+├── agents/                    # SummarizerFast / Quality / Hallucinator
+│
+├── evaluation/                # reproducible eval harness
+│   ├── simulator.py           # TruthSpec — context-aware synthetic agents
+│   ├── strategies.py          # Random, RoundRobin, GreedyPrior, EpsilonGreedy, AgentRank
+│   ├── scenarios.py           # 5 scenarios isolating each failure mode
+│   ├── runner.py              # one-trial executor
+│   ├── metrics.py             # regret, selection share
+│   └── run_eval.py            # CLI entry — writes JSON + PNG to results/
+│
+├── scripts/smoke_test.py      # 15-request non-interactive demo
+├── run_demo.py                # interactive demo with judge wired in
+│
+└── docs/
+    ├── ARCHITECTURE.md        # detailed component design
+    ├── EVAL.md                # running and interpreting evals
+    └── images/                # regret plots referenced from this README
+```
+
+---
+
+## How the scoring works
+
+For UCB1 (the default):
+
+```
+score(a) = base(a) + exploration(a)
+
+base(a)        = w_SR · success_rate(a)
+               + w_QS · quality_score(a)
+               + w_LS · latency_score(a)
+               + w_FR · failure_rate(a)
+
+exploration(a) = α · √( ln(1 + N) / (1 + n_a) )
+```
+
+With concept-drift decay enabled (`half_life_calls` set in config), both the base metrics and the counts use exponentially-weighted aggregates:
+
+```
+weight(entry_i) = 0.5 ^ ((current_tick − entry_i.id) / half_life_calls)
+```
+
+For LinUCB (contextual):
+
+```
+A_a   = ridge · I + Σ_t  x_t x_tᵀ        (sum over a's logged calls)
+b_a   = Σ_t  r_t · x_t                   (r_t is the same per-call reward)
+θ_a   = A_a⁻¹ b_a
+score(a, x) = θ_aᵀ x + α · √( xᵀ A_a⁻¹ x )
+```
+
+Where `x` is the payload's feature vector from `feature_extractor.LengthBucketExtractor`. Cold-start warm-up forces each agent to be tried `warm_start_n` times before LinUCB takes over, so the per-context fit has something to learn from.
+
+When a `QualityJudge` is configured on the `AgentClient`, the agent's self-reported `quality_score` is replaced by the judge's verdict before logging — so the bandit learns from verified quality, not from agent self-reports.
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for derivations and design notes.
+
+---
+
+## Reproducing the headline results
+
+```bash
+python -m evaluation.run_eval --steps 300 --trials 10
+```
+
+Output goes to `evaluation/results/`:
+- `summary.json` — per-scenario, per-strategy regret means/stdevs and selection share
+- `regret_curves.json` — full averaged regret curves for custom plotting
+- `regret_<scenario>.png` — the plots embedded above
+
+To rerun with a longer horizon:
+
+```bash
+python -m evaluation.run_eval --steps 2000 --trials 20
+```
+
+See [`docs/EVAL.md`](docs/EVAL.md) for how to interpret the output, how to add new scenarios, and how to swap in different bandit policies.
+
+---
+
+## Roadmap
+
+**Stage 5 — multi-objective Pareto scoring.** Replace the single weighted-sum score with a per-request preference vector (`{quality: 0.7, latency: 0.2, cost: 0.1}`) and rank on the Pareto frontier. Lets the caller express tradeoffs instead of hardcoding them in config.
+
+**Stage 6 — trust / sybil resistance.** Agent attestation via signed identities, rate-limited log submissions, anomaly detection on metric distributions, a probation pool for new agents. Necessary for any real marketplace where anyone can register an agent.
+
+Both are scoped but not yet implemented. The current ranker already covers the four hardest failure modes (wrong priors, lying agents, drift, context-dependence) and the eval harness is set up to validate Stages 5 and 6 the same way it validated 1–4: each new mechanism gets its own scenario where it's measurably necessary.

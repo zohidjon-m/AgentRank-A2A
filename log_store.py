@@ -113,6 +113,36 @@ class LogStore:
         )
         self._conn.commit()
 
+    def recent_selections(self, n: int):
+        """Last `n` agent_ids selected, newest last. Used by trust policy."""
+        rows = self._conn.execute(
+            """
+            SELECT agent_id FROM invocations
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(n),),
+        ).fetchall()
+        return [r["agent_id"] for r in reversed(rows)]
+
+    def recent_claimed_quality(self, agent_id: str, n: int):
+        """
+        Last `n` claimed-quality scores for the agent (pre-judge
+        override is in `agent_claimed_quality` if a judge ran, else
+        `quality_score` is itself the claim). Newest last.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT COALESCE(agent_claimed_quality, quality_score) AS q
+            FROM invocations
+            WHERE agent_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (agent_id, int(n)),
+        ).fetchall()
+        return [float(r["q"]) for r in reversed(rows)]
+
     def get_contextual_logs(self, agent_id: str):
         """
         Yield rows containing the fields LinUCB needs: success,

@@ -18,6 +18,7 @@ from domain_registry import DomainRegistry
 from config_loader import ScoringConfig
 from bandits import build_bandit
 from feature_extractor import get_extractor, PayloadFeatureExtractor
+from trust import ProbationPolicy, TrustConfig
 
 
 class AgentRankService:
@@ -79,6 +80,12 @@ class AgentRankService:
             context_features=features,
             preferences=preferences,
         )
+
+        # Trust pass: rearrange/tag entries based on the probation policy.
+        # Permissive default config is a no-op; non-default configs cap
+        # exposure of probation / inflated-claim agents.
+        trust_cfg = TrustConfig(**policy["trust"])
+        ranking = ProbationPolicy(trust_cfg).adjust(ranking, self.log_store)
         return ranking, features
 
     # ---- helpers -----------------------------------------------------------

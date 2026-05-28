@@ -12,7 +12,7 @@ By varying the relationship between truth and priors we can isolate
 
 import random
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Callable
+from typing import List, Dict, Optional, Callable, Any
 
 from .simulator import TruthSpec
 
@@ -76,6 +76,9 @@ class Scenario:
     enable_linucb_variant_extractor: Optional[str] = None
     # When set, run_eval registers a Pareto multi-objective variant.
     enable_pareto_variant: bool = False
+    # When set (to a TrustConfig kwargs dict), run_eval registers an
+    # AgentRank variant with that trust policy applied.
+    enable_trust_variant: Optional[Dict[str, Any]] = None
     # Optional payload generator. Returns the text payload for one
     # request given an RNG. Defaults to empty string (no context).
     payload_generator: Optional[Callable[[random.Random], str]] = field(
@@ -448,6 +451,93 @@ SCENARIO_PREFERENCE_DEPENDENT = Scenario(
 )
 
 
+# ---------------------------------------------------------------------------
+# Scenario G: sybil attack.
+#
+# An attacker spawns 10 fresh agents, each with an inflated cold-start
+# prior (claimed quality 0.99) but actually delivering quality ~0.05.
+# The 3 honest agents (SummarizerFast/Quality/Hallucinator) are the
+# same as in scenario A but with realistic (lower) priors. The attacker
+# also reports inflated quality on every call, so without a judge the
+# bandit has no way to learn the truth from the observed signal alone.
+#
+# UCB1 will explore each fake agent, lose calls, and may even converge
+# on one of them by chance. The trust-protected AgentRank caps probation
+# agents (those with < min_trusted_invocations) at a small fraction of
+# recent selections, so the attacker's flood is bounded.
+# ---------------------------------------------------------------------------
+
+
+def _make_sybil_specs(n: int) -> List[TruthSpec]:
+    """n fresh attacker agents: all claim 0.99, all deliver 0.05."""
+    out = []
+    for i in range(n):
+        out.append(TruthSpec(
+            agent_id=f"SybilAgent_{i:02d}",
+            success_prob=1.0,
+            quality_mean=0.05,
+            claimed_quality_mean=0.99,  # the lie
+            latency_min_ms=100,
+            latency_max_ms=200,
+        ))
+    return out
+
+
+def _make_sybil_priors(n: int) -> Dict[str, Dict[str, float]]:
+    """Inflated priors for each sybil to ensure UCB picks them early."""
+    out = {}
+    for i in range(n):
+        out[f"SybilAgent_{i:02d}"] = {
+            "success_rate": 0.99, "quality_score": 0.99,
+            "latency_score": 0.95, "failure_rate": 0.01,
+        }
+    return out
+
+
+_HONEST_AGENTS = [
+    TruthSpec("SummarizerFast", success_prob=1.00, quality_mean=0.50,
+              latency_min_ms=80, latency_max_ms=120),
+    TruthSpec("SummarizerQuality", success_prob=1.00, quality_mean=0.90,
+              latency_min_ms=700, latency_max_ms=900),
+    TruthSpec("SummarizerHallucinator", success_prob=0.70, quality_mean=0.20,
+              latency_min_ms=200, latency_max_ms=1200),
+]
+_HONEST_PRIORS = {
+    "SummarizerFast": {"success_rate": 0.95, "quality_score": 0.5,
+                       "latency_score": 0.9, "failure_rate": 0.05},
+    "SummarizerQuality": {"success_rate": 0.98, "quality_score": 0.9,
+                          "latency_score": 0.7, "failure_rate": 0.02},
+    "SummarizerHallucinator": {"success_rate": 0.7, "quality_score": 0.2,
+                               "latency_score": 0.6, "failure_rate": 0.3},
+}
+
+
+SCENARIO_SYBIL_ATTACK = Scenario(
+    name="sybil_attack",
+    description=(
+        "An attacker spawns 10 fresh agents, each with inflated priors "
+        "(claimed quality 0.99) but actually delivering ~0.05. They also "
+        "self-report 0.99 on every call (no judge in this scenario). "
+        "Vanilla AgentRank wastes exploration on them and is fooled by "
+        "the lying claims. AgentRank with a probation policy caps fresh "
+        "agents' collective exposure until they earn trust."
+    ),
+    agents=_HONEST_AGENTS + _make_sybil_specs(10),
+    priors={**_HONEST_PRIORS, **_make_sybil_priors(10)},
+    enable_trust_variant={
+        "trusted_agents": [
+            "SummarizerFast",
+            "SummarizerQuality",
+            "SummarizerHallucinator",
+        ],
+        "min_trusted_invocations": 25,
+        "max_probation_share": 0.10,
+        "window_size": 50,
+        "detect_inflated_claims": True,
+    },
+)
+
+
 ALL_SCENARIOS = [
     SCENARIO_PRIORS_CORRECT,
     SCENARIO_HIDDEN_GEM,
@@ -455,4 +545,5 @@ ALL_SCENARIOS = [
     SCENARIO_CONCEPT_DRIFT,
     SCENARIO_CONTEXT_AWARE,
     SCENARIO_PREFERENCE_DEPENDENT,
+    SCENARIO_SYBIL_ATTACK,
 ]

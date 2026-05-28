@@ -41,6 +41,18 @@ _DEFAULT_POLICY = {
     "feature_extractor": None,
     # Optional per-bandit parameters (e.g., {"ridge": 1.0} for LinUCB).
     "bandit_params": {},
+    # Trust / sybil-resistance policy. Default is permissive (no cap),
+    # so existing scenarios keep their behavior. See trust.TrustConfig.
+    "trust": {
+        "trusted_agents": [],
+        "min_trusted_invocations": 0,
+        "max_probation_share": 1.0,
+        "window_size": 50,
+        "detect_inflated_claims": False,
+        "inflated_min_calls": 5,
+        "inflated_quality_floor": 0.95,
+        "inflated_stdev_ceiling": 0.02,
+    },
 }
 
 
@@ -75,6 +87,7 @@ class ScoringConfig:
         exploration = {**_DEFAULT_POLICY["exploration"], **policy.get("exploration", {})}
         drift = {**_DEFAULT_POLICY["drift"], **policy.get("drift", {})}
         bandit_params = {**_DEFAULT_POLICY["bandit_params"], **policy.get("bandit_params", {})}
+        trust = {**_DEFAULT_POLICY["trust"], **policy.get("trust", {})}
         return {
             "weights": weights,
             "exploration": exploration,
@@ -84,6 +97,7 @@ class ScoringConfig:
                 "feature_extractor", _DEFAULT_POLICY["feature_extractor"]
             ),
             "bandit_params": bandit_params,
+            "trust": trust,
         }
 
     # ---- agent priors ------------------------------------------------------
@@ -148,6 +162,23 @@ class ScoringConfig:
             )
         domains[domain_key].setdefault("drift", {})
         domains[domain_key]["drift"]["half_life_calls"] = half_life_calls
+        return ScoringConfig(new_raw)
+
+    def with_trust(
+        self,
+        domain_key: str,
+        **trust_overrides: Any,
+    ) -> "ScoringConfig":
+        """Return a clone with trust policy keys overridden for one domain."""
+        new_raw = copy.deepcopy(self._raw)
+        scoring = new_raw.setdefault("scoring", {})
+        domains = scoring.setdefault("domains", {})
+        if domain_key not in domains:
+            domains[domain_key] = copy.deepcopy(
+                scoring.get("default", _DEFAULT_POLICY)
+            )
+        domains[domain_key].setdefault("trust", {})
+        domains[domain_key]["trust"].update(trust_overrides)
         return ScoringConfig(new_raw)
 
     def with_bandit(

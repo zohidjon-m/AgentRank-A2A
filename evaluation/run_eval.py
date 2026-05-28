@@ -106,6 +106,18 @@ def build_strategies(scenario: Scenario, config: ScoringConfig, seed: int):
                 variant_suffix="_pareto",
             )
         )
+    if scenario.enable_trust_variant is not None:
+        trust_cfg = config.with_trust(
+            "nlp/summarize",
+            **scenario.enable_trust_variant,
+        )
+        strategies.append(
+            AgentRankStrategy(
+                trust_cfg, domain="nlp", task_type="summarize",
+                candidates=scenario.candidates(), priors=scenario.priors,
+                variant_suffix="_protected",
+            )
+        )
     return strategies
 
 

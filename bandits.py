@@ -22,6 +22,7 @@ from typing import List, Dict, Any, Optional
 import numpy as np
 
 from log_store import LogStore
+from pareto import pareto_frontier_indices, normalize_preferences
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +40,7 @@ class BanditPolicy(ABC):
         weights: Dict[str, float],
         log_store: LogStore,
         context_features: Optional[np.ndarray] = None,
+        preferences: Optional[Dict[str, float]] = None,
     ) -> List[Dict[str, Any]]:
         ...
 
@@ -82,7 +84,7 @@ class UCB1Bandit(BanditPolicy):
         self._alpha = alpha
         self._half_life = half_life_calls
 
-    def rank(self, candidates, weights, log_store, context_features=None):
+    def rank(self, candidates, weights, log_store, context_features=None, preferences=None):
         total_w, per_agent = log_store.get_weighted_counts(self._half_life)
         out: List[Dict[str, Any]] = []
         for agent_id in candidates:
@@ -145,7 +147,7 @@ class LinUCBBandit(BanditPolicy):
         self._ridge = ridge
         self._warm_start_n = warm_start_n
 
-    def rank(self, candidates, weights, log_store, context_features=None):
+    def rank(self, candidates, weights, log_store, context_features=None, preferences=None):
         if context_features is None:
             raise ValueError("LinUCBBandit requires context_features.")
         x = np.asarray(context_features, dtype=float).flatten()
@@ -242,6 +244,113 @@ class LinUCBBandit(BanditPolicy):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Pareto / multi-objective
+# ---------------------------------------------------------------------------
+
+
+class ParetoBandit(BanditPolicy):
+    """
+    Multi-objective ranking with per-request preference vectors.
+
+    The fixed-weight UCB1 formula pre-commits to one tradeoff (e.g. quality
+    weighs 0.5, latency 0.15). Real callers want different tradeoffs per
+    request: a chatbot UI wants low latency, a research summarizer wants
+    high quality, a batch job wants low cost. ParetoBandit lets each
+    request pass its own preference vector and ranks accordingly.
+
+    Per-agent objective vector (all in [0, 1], higher is better):
+        [quality_score, latency_score, cost_score, success_rate]
+
+    A UCB-style optimism term is added per dimension so under-explored
+    agents get a fair shot:
+        objective_ucb_i(a) = obj_i(a) + alpha * sqrt(ln(1+N) / (1+n_a))
+
+    From the (optimistic) Pareto frontier we pick the point that maximizes
+    `preferences @ objective_ucb`.
+
+    With strictly positive preferences the dot-product maximizer is always
+    Pareto-optimal, so the explicit frontier step is informational. It
+    matters when callers want constrained queries ("minimize cost subject
+    to quality >= 0.7") which is a planned extension.
+    """
+    name = "pareto"
+    OBJECTIVE_KEYS = ("quality_score", "latency_score", "cost_score", "success_rate")
+
+    def __init__(
+        self,
+        alpha: float,
+        half_life_calls: Optional[float] = None,
+        cost_reference_cents: float = 10.0,
+        default_preferences: Optional[Dict[str, float]] = None,
+    ):
+        self._alpha = alpha
+        self._half_life = half_life_calls
+        self._cost_ref = cost_reference_cents
+        self._default_prefs = default_preferences or {
+            "quality_score": 0.5,
+            "latency_score": 0.2,
+            "cost_score": 0.2,
+            "success_rate": 0.1,
+        }
+
+    def rank(self, candidates, weights, log_store, context_features=None, preferences=None):
+        prefs_dict = preferences if preferences is not None else self._default_prefs
+        prefs_vec = normalize_preferences(prefs_dict, self.OBJECTIVE_KEYS)
+
+        total_w, per_agent = log_store.get_weighted_counts(self._half_life)
+
+        # Per-agent objective + optimism vectors.
+        obj_vectors: List[List[float]] = []
+        ucb_vectors: List[List[float]] = []
+        n_a_list: List[float] = []
+        metrics_list: List[Dict[str, float]] = []
+
+        for agent_id in candidates:
+            objs = log_store.get_objective_vector(
+                agent_id,
+                half_life_calls=self._half_life,
+                cost_reference_cents=self._cost_ref,
+            )
+            obj_vec = [float(objs[k]) for k in self.OBJECTIVE_KEYS]
+            n_a = per_agent.get(agent_id, 0.0)
+            n_a_list.append(n_a)
+            bonus = self._alpha * math.sqrt(math.log(1 + total_w) / (1 + n_a))
+            # Optimism in face of uncertainty: lift every dim by the same
+            # bonus (and cap at 1 so the frontier comparison stays sane).
+            ucb_vec = [min(1.0, v + bonus) for v in obj_vec]
+            obj_vectors.append(obj_vec)
+            ucb_vectors.append(ucb_vec)
+            metrics_list.append(objs)
+
+        # Pareto frontier on the optimistic objectives.
+        frontier_idx = set(pareto_frontier_indices(ucb_vectors))
+
+        out: List[Dict[str, Any]] = []
+        for i, agent_id in enumerate(candidates):
+            score = sum(p * v for p, v in zip(prefs_vec, ucb_vectors[i]))
+            base = sum(p * v for p, v in zip(prefs_vec, obj_vectors[i]))
+            out.append({
+                "agent_id": agent_id,
+                "score": round(score, 4),
+                "base_score": round(base, 4),
+                "exploration_bonus": round(score - base, 4),
+                "n_a": round(n_a_list[i], 2),
+                "metrics": metrics_list[i],
+                "on_frontier": i in frontier_idx,
+                "objective_vector": ucb_vectors[i],
+                "preferences": dict(zip(self.OBJECTIVE_KEYS, prefs_vec)),
+                "bandit": self.name,
+            })
+        out.sort(key=lambda r: r["score"], reverse=True)
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+
 def build_bandit(policy: Dict[str, Any], feature_dim: int = 0) -> BanditPolicy:
     """
     Construct a bandit instance from a domain policy dict.
@@ -271,6 +380,17 @@ def build_bandit(policy: Dict[str, Any], feature_dim: int = 0) -> BanditPolicy:
             feature_dim=feature_dim,
             ridge=ridge,
             warm_start_n=warm,
+        )
+
+    if kind == "pareto":
+        half_life = policy.get("drift", {}).get("half_life_calls")
+        cost_ref = float(bp.get("cost_reference_cents", 10.0))
+        default_prefs = bp.get("default_preferences")
+        return ParetoBandit(
+            alpha=alpha,
+            half_life_calls=half_life,
+            cost_reference_cents=cost_ref,
+            default_preferences=default_prefs,
         )
 
     raise ValueError(f"Unknown bandit kind: {kind!r}")

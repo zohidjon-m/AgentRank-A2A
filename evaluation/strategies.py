@@ -21,7 +21,7 @@ from judge import QualityJudge
 class Strategy:
     name: str = "base"
 
-    def select(self, candidates: List[str], payload: str = "") -> str:
+    def select(self, candidates: List[str], payload: str = "", preferences=None) -> str:
         raise NotImplementedError
 
     def update(self, agent_id: str, outcome: Dict[str, Any]) -> None:
@@ -35,7 +35,7 @@ class RandomStrategy(Strategy):
     def __init__(self, rng: random.Random):
         self._rng = rng
 
-    def select(self, candidates: List[str], payload: str = "") -> str:
+    def select(self, candidates: List[str], payload: str = "", preferences=None) -> str:
         return self._rng.choice(candidates)
 
 
@@ -46,7 +46,7 @@ class RoundRobinStrategy(Strategy):
     def __init__(self):
         self._i = 0
 
-    def select(self, candidates: List[str], payload: str = "") -> str:
+    def select(self, candidates: List[str], payload: str = "", preferences=None) -> str:
         choice = candidates[self._i % len(candidates)]
         self._i += 1
         return choice
@@ -79,7 +79,7 @@ class GreedyPriorStrategy(Strategy):
             + self._weights["failure_rate"] * p["failure_rate"]
         )
 
-    def select(self, candidates: List[str], payload: str = "") -> str:
+    def select(self, candidates: List[str], payload: str = "", preferences=None) -> str:
         return max(candidates, key=self._score)
 
 
@@ -108,7 +108,7 @@ class EpsilonGreedyStrategy(Strategy):
             return float("inf")  # try untried agents first
         return self._reward_sum[agent_id] / self._counts[agent_id]
 
-    def select(self, candidates: List[str], payload: str = "") -> str:
+    def select(self, candidates: List[str], payload: str = "", preferences=None) -> str:
         if self._rng.random() < self._epsilon:
             return self._rng.choice(candidates)
         return max(candidates, key=self._mean_reward)
@@ -166,8 +166,10 @@ class AgentRankStrategy(Strategy):
         if variant_suffix:
             self.name = f"agent_rank{variant_suffix}"
 
-    def select(self, candidates: List[str], payload: str = "") -> str:
-        ranking = self._service.rank(self._domain, self._task_type, payload)
+    def select(self, candidates: List[str], payload: str = "", preferences=None) -> str:
+        ranking = self._service.rank(
+            self._domain, self._task_type, payload, preferences=preferences,
+        )
         return ranking[0]["agent_id"]
 
     def update(self, agent_id: str, outcome: Dict[str, Any]) -> None:

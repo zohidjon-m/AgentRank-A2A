@@ -51,7 +51,8 @@ class LogStore:
                 judge_name TEXT,
                 judge_reason TEXT,
                 agent_claimed_quality REAL,
-                context_features TEXT
+                context_features TEXT,
+                cost_cents REAL
             )
             """
         )
@@ -59,14 +60,12 @@ class LogStore:
             "CREATE INDEX IF NOT EXISTS idx_invocations_agent ON invocations(agent_id)"
         )
 
-        # Best-effort migration for databases created before later columns
-        # existed. ALTER TABLE ADD COLUMN is idempotent here only if we
-        # guard against duplicate-column errors.
         for col, decl in [
             ("judge_name", "TEXT"),
             ("judge_reason", "TEXT"),
             ("agent_claimed_quality", "REAL"),
             ("context_features", "TEXT"),
+            ("cost_cents", "REAL"),
         ]:
             try:
                 self._conn.execute(f"ALTER TABLE invocations ADD COLUMN {col} {decl}")
@@ -94,8 +93,8 @@ class LogStore:
                 (agent_id, success, quality_score, latency_ms,
                  failure_reason, timestamp,
                  judge_name, judge_reason, agent_claimed_quality,
-                 context_features)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 context_features, cost_cents)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 metrics["agent_id"],
@@ -108,6 +107,8 @@ class LogStore:
                 metrics.get("judge_reason"),
                 metrics.get("agent_claimed_quality"),
                 ctx,
+                (float(metrics["cost_cents"])
+                 if metrics.get("cost_cents") is not None else None),
             ),
         )
         self._conn.commit()
@@ -181,6 +182,45 @@ class LogStore:
             per_agent[agent_id] += w
             total += w
         return total, dict(per_agent)
+
+    def get_objective_vector(
+        self,
+        agent_id: str,
+        half_life_calls: Optional[float] = None,
+        cost_reference_cents: float = 10.0,
+    ) -> Dict[str, float]:
+        """
+        Returns the agent's per-objective scores for Pareto / multi-objective
+        ranking. Adds a cost_score dimension on top of the existing
+        compute_metrics fields. All values are in [0, 1], higher is better.
+
+            cost_score = 1 - min(avg_cost_cents / cost_reference_cents, 1)
+
+        Falls back to a cost_score of 0.5 if the agent has no logged costs
+        and no prior is configured.
+        """
+        base = self.compute_metrics(agent_id, half_life_calls=half_life_calls)
+        # Pull cost samples (these may be NULL for legacy rows).
+        rows = self._conn.execute(
+            """
+            SELECT cost_cents FROM invocations
+            WHERE agent_id = ? AND cost_cents IS NOT NULL
+            """,
+            (agent_id,),
+        ).fetchall()
+        if rows:
+            avg_cost = sum(float(r["cost_cents"]) for r in rows) / len(rows)
+            cost_score = 1.0 - min(avg_cost / cost_reference_cents, 1.0)
+        else:
+            # No cost observations -> fall back to prior or neutral 0.5
+            cost_score = float(base.get("cost_score", 0.5))
+        return {
+            "success_rate": base["success_rate"],
+            "quality_score": base["quality_score"],
+            "latency_score": base["latency_score"],
+            "failure_rate": base["failure_rate"],
+            "cost_score": cost_score,
+        }
 
     def compute_metrics(
         self,

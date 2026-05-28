@@ -12,9 +12,39 @@ By varying the relationship between truth and priors we can isolate
 
 import random
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Callable
+from typing import List, Dict, Optional, Callable, Any
 
 from .simulator import TruthSpec
+
+
+def _expected_preference_reward(
+    spec: TruthSpec,
+    features,
+    preferences: Dict[str, float],
+) -> float:
+    """
+    Analytic expected preference-weighted reward for one spec under one
+    preference vector. Mirrors simulator.preference_reward.
+    """
+    p = spec.success_prob
+    q_mean = spec.true_quality_mean_for(features)
+    e_quality = p * q_mean
+    avg_latency = (spec.latency_min_ms + spec.latency_max_ms) / 2
+    e_latency = 1.0 - min(avg_latency / 3000.0, 1.0)
+    e_cost = 1.0 - min(float(spec.cost_cents) / 10.0, 1.0)
+    objs = {
+        "quality_score": e_quality,
+        "latency_score": e_latency,
+        "cost_score": e_cost,
+        "success_rate": p,
+    }
+    total = sum(max(0.0, float(preferences.get(k, 0.0))) for k in objs)
+    if total <= 0:
+        return 0.0
+    return sum(
+        objs[k] * max(0.0, float(preferences.get(k, 0.0))) / total
+        for k in objs
+    )
 
 
 # The default scoring policy from config/scoring.json (nlp/summarize domain).
@@ -44,9 +74,20 @@ class Scenario:
     # When set, run_eval registers a LinUCB variant using this feature
     # extractor name (must be present in feature_extractor.FEATURE_EXTRACTORS).
     enable_linucb_variant_extractor: Optional[str] = None
+    # When set, run_eval registers a Pareto multi-objective variant.
+    enable_pareto_variant: bool = False
+    # When set (to a TrustConfig kwargs dict), run_eval registers an
+    # AgentRank variant with that trust policy applied.
+    enable_trust_variant: Optional[Dict[str, Any]] = None
     # Optional payload generator. Returns the text payload for one
     # request given an RNG. Defaults to empty string (no context).
     payload_generator: Optional[Callable[[random.Random], str]] = field(
+        default=None, repr=False
+    )
+    # Optional per-request preference generator. Returns a preferences
+    # dict for one request given an RNG. When set, regret is measured
+    # against an oracle that knows the preference for each request.
+    preference_generator: Optional[Callable[[random.Random], Dict[str, float]]] = field(
         default=None, repr=False
     )
 
@@ -54,6 +95,11 @@ class Scenario:
         if self.payload_generator is None:
             return ""
         return self.payload_generator(rng)
+
+    def gen_preferences(self, rng: random.Random) -> Optional[Dict[str, float]]:
+        if self.preference_generator is None:
+            return None
+        return self.preference_generator(rng)
 
     def candidates(self) -> List[str]:
         return [a.agent_id for a in self.agents]
@@ -64,14 +110,25 @@ class Scenario:
             return self.drift_agents
         return self.agents
 
-    def oracle_reward_at_step(self, t: int, features=None) -> float:
+    def oracle_reward_at_step(
+        self,
+        t: int,
+        features=None,
+        preferences: Optional[Dict[str, float]] = None,
+    ) -> float:
         """
-        Best achievable expected reward at step t (post-drift if applicable).
-        When features are supplied, picks the best agent *for that context*
-        — this matters for contextual scenarios where different agents win
-        for different inputs.
+        Best achievable expected reward at step t. Handles three regimes:
+          - features supplied: oracle picks the best agent for that context
+          - preferences supplied: oracle scores agents on their objective
+            vector using the per-request preferences (Pareto regime)
+          - neither: stationary fixed-weight oracle
         """
         specs = self.specs_at_step(t)
+        if preferences is not None:
+            return max(
+                _expected_preference_reward(s, features, preferences)
+                for s in specs
+            )
         return max(s.expected_reward(self.weights, features=features) for s in specs)
 
     def oracle_agent(self) -> str:
@@ -329,10 +386,164 @@ SCENARIO_CONTEXT_AWARE = Scenario(
 )
 
 
+# ---------------------------------------------------------------------------
+# Scenario F: preference-dependent ranking.
+#
+# Three summarizers with very different cost/quality/latency tradeoffs:
+#   PremiumSlow:    great quality, slow, expensive
+#   BalancedMid:    OK quality, medium speed, medium cost
+#   BudgetFast:     low quality, very fast, very cheap
+#
+# Each request comes with its own preference vector:
+#   ~1/3 quality-first:   {quality: 0.85, latency: 0.10, cost: 0.05}
+#   ~1/3 latency-first:   {quality: 0.10, latency: 0.80, cost: 0.10}
+#   ~1/3 cost-first:      {quality: 0.10, latency: 0.10, cost: 0.80}
+#
+# No single agent is best for every preference. UCB1's fixed-weight
+# scoring locks onto one global "winner" and pays linear regret on the
+# other request types. ParetoBandit reads the per-request preferences
+# and routes accordingly.
+# ---------------------------------------------------------------------------
+
+
+def _varied_preferences(rng: random.Random) -> Dict[str, float]:
+    bucket = rng.choice(("quality", "latency", "cost"))
+    if bucket == "quality":
+        return {"quality_score": 0.85, "latency_score": 0.10,
+                "cost_score": 0.05, "success_rate": 0.0}
+    if bucket == "latency":
+        return {"quality_score": 0.10, "latency_score": 0.80,
+                "cost_score": 0.10, "success_rate": 0.0}
+    return {"quality_score": 0.10, "latency_score": 0.10,
+            "cost_score": 0.80, "success_rate": 0.0}
+
+
+SCENARIO_PREFERENCE_DEPENDENT = Scenario(
+    name="preference_dependent",
+    description=(
+        "Three agents with different tradeoffs: premium-slow-expensive, "
+        "balanced, budget-fast-cheap. Each request carries its own "
+        "preference vector (quality-first / latency-first / cost-first). "
+        "UCB1 picks one global winner; ParetoBandit reads the per-request "
+        "preferences and routes accordingly."
+    ),
+    agents=[
+        TruthSpec("PremiumSlow", success_prob=1.0, quality_mean=0.95,
+                  latency_min_ms=1800, latency_max_ms=2200, cost_cents=8.0),
+        TruthSpec("BalancedMid", success_prob=1.0, quality_mean=0.65,
+                  latency_min_ms=500, latency_max_ms=700, cost_cents=2.5),
+        TruthSpec("BudgetFast", success_prob=1.0, quality_mean=0.35,
+                  latency_min_ms=60, latency_max_ms=100, cost_cents=0.3),
+    ],
+    priors={
+        "PremiumSlow": {"success_rate": 0.98, "quality_score": 0.95,
+                        "latency_score": 0.35, "cost_score": 0.20,
+                        "failure_rate": 0.02},
+        "BalancedMid": {"success_rate": 0.95, "quality_score": 0.65,
+                        "latency_score": 0.80, "cost_score": 0.75,
+                        "failure_rate": 0.05},
+        "BudgetFast": {"success_rate": 0.92, "quality_score": 0.35,
+                       "latency_score": 0.97, "cost_score": 0.97,
+                       "failure_rate": 0.08},
+    },
+    preference_generator=_varied_preferences,
+    enable_pareto_variant=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# Scenario G: sybil attack.
+#
+# An attacker spawns 10 fresh agents, each with an inflated cold-start
+# prior (claimed quality 0.99) but actually delivering quality ~0.05.
+# The 3 honest agents (SummarizerFast/Quality/Hallucinator) are the
+# same as in scenario A but with realistic (lower) priors. The attacker
+# also reports inflated quality on every call, so without a judge the
+# bandit has no way to learn the truth from the observed signal alone.
+#
+# UCB1 will explore each fake agent, lose calls, and may even converge
+# on one of them by chance. The trust-protected AgentRank caps probation
+# agents (those with < min_trusted_invocations) at a small fraction of
+# recent selections, so the attacker's flood is bounded.
+# ---------------------------------------------------------------------------
+
+
+def _make_sybil_specs(n: int) -> List[TruthSpec]:
+    """n fresh attacker agents: all claim 0.99, all deliver 0.05."""
+    out = []
+    for i in range(n):
+        out.append(TruthSpec(
+            agent_id=f"SybilAgent_{i:02d}",
+            success_prob=1.0,
+            quality_mean=0.05,
+            claimed_quality_mean=0.99,  # the lie
+            latency_min_ms=100,
+            latency_max_ms=200,
+        ))
+    return out
+
+
+def _make_sybil_priors(n: int) -> Dict[str, Dict[str, float]]:
+    """Inflated priors for each sybil to ensure UCB picks them early."""
+    out = {}
+    for i in range(n):
+        out[f"SybilAgent_{i:02d}"] = {
+            "success_rate": 0.99, "quality_score": 0.99,
+            "latency_score": 0.95, "failure_rate": 0.01,
+        }
+    return out
+
+
+_HONEST_AGENTS = [
+    TruthSpec("SummarizerFast", success_prob=1.00, quality_mean=0.50,
+              latency_min_ms=80, latency_max_ms=120),
+    TruthSpec("SummarizerQuality", success_prob=1.00, quality_mean=0.90,
+              latency_min_ms=700, latency_max_ms=900),
+    TruthSpec("SummarizerHallucinator", success_prob=0.70, quality_mean=0.20,
+              latency_min_ms=200, latency_max_ms=1200),
+]
+_HONEST_PRIORS = {
+    "SummarizerFast": {"success_rate": 0.95, "quality_score": 0.5,
+                       "latency_score": 0.9, "failure_rate": 0.05},
+    "SummarizerQuality": {"success_rate": 0.98, "quality_score": 0.9,
+                          "latency_score": 0.7, "failure_rate": 0.02},
+    "SummarizerHallucinator": {"success_rate": 0.7, "quality_score": 0.2,
+                               "latency_score": 0.6, "failure_rate": 0.3},
+}
+
+
+SCENARIO_SYBIL_ATTACK = Scenario(
+    name="sybil_attack",
+    description=(
+        "An attacker spawns 10 fresh agents, each with inflated priors "
+        "(claimed quality 0.99) but actually delivering ~0.05. They also "
+        "self-report 0.99 on every call (no judge in this scenario). "
+        "Vanilla AgentRank wastes exploration on them and is fooled by "
+        "the lying claims. AgentRank with a probation policy caps fresh "
+        "agents' collective exposure until they earn trust."
+    ),
+    agents=_HONEST_AGENTS + _make_sybil_specs(10),
+    priors={**_HONEST_PRIORS, **_make_sybil_priors(10)},
+    enable_trust_variant={
+        "trusted_agents": [
+            "SummarizerFast",
+            "SummarizerQuality",
+            "SummarizerHallucinator",
+        ],
+        "min_trusted_invocations": 25,
+        "max_probation_share": 0.10,
+        "window_size": 50,
+        "detect_inflated_claims": True,
+    },
+)
+
+
 ALL_SCENARIOS = [
     SCENARIO_PRIORS_CORRECT,
     SCENARIO_HIDDEN_GEM,
     SCENARIO_LYING_AGENT,
     SCENARIO_CONCEPT_DRIFT,
     SCENARIO_CONTEXT_AWARE,
+    SCENARIO_PREFERENCE_DEPENDENT,
+    SCENARIO_SYBIL_ATTACK,
 ]

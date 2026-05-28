@@ -24,12 +24,19 @@ class AgentClient:
         self.rank_service = rank_service
         self.judge = judge
 
-    def handle_task(self, domain: str, task_type: str, payload: str) -> Dict[str, Any]:
+    def handle_task(
+        self,
+        domain: str,
+        task_type: str,
+        payload: str,
+        preferences=None,
+    ) -> Dict[str, Any]:
         # 1) Ask AgentRank for the best agent (and the extracted features,
         #    which we'll persist alongside the invocation so the bandit
-        #    can learn from them).
+        #    can learn from them). preferences flow through to ParetoBandit
+        #    when configured; other bandits ignore them.
         ranking, features = self.rank_service.rank_with_features(
-            domain, task_type, payload
+            domain, task_type, payload, preferences=preferences,
         )
 
         if not ranking:

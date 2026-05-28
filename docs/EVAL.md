@@ -112,7 +112,7 @@ linearly forever.
 
 ---
 
-## The five scenarios
+## The seven scenarios
 
 Each is designed to isolate one specific failure mode. The point isn't
 to show AgentRank beating baselines on a single benchmark — it's to
@@ -126,14 +126,23 @@ AgentRank (with the right policy plugins) handles all of them.
 | `lying_agent` | Agent inflates its own quality score | `agent_rank_judged` (judge catches lie) |
 | `concept_drift` | Best agent changes mid-trial | `agent_rank` / `agent_rank_decayed` |
 | `context_aware` | Best agent depends on the request | `agent_rank_linucb` (per-context routing) |
+| `preference_dependent` | Caller's quality/latency/cost tradeoff varies per request | `agent_rank_pareto` (per-preference routing) |
+| `sybil_attack` | Attacker spawns many fake agents with inflated claims | `agent_rank_protected` (probation + anomaly cap) |
 
-The judged / decayed / linucb variants of `agent_rank` are registered
+The plugin-enhanced variants of `agent_rank` are registered
 automatically when a scenario opts in via:
 
 ```python
 enable_judge_variant = True              # registers agent_rank_judged
 enable_decay_variant_half_life = 40.0    # registers agent_rank_decayed
 enable_linucb_variant_extractor = "..."  # registers agent_rank_linucb
+enable_pareto_variant = True             # registers agent_rank_pareto
+enable_trust_variant = {                 # registers agent_rank_protected
+    "trusted_agents": [...],
+    "min_trusted_invocations": 25,
+    "max_probation_share": 0.10,
+    "detect_inflated_claims": True,
+}
 ```
 
 So a single scenario can compare bare AgentRank against the
@@ -168,8 +177,14 @@ SCENARIO_MY_THING = Scenario(
     # enable_judge_variant=True,
     # enable_decay_variant_half_life=40.0,
     # enable_linucb_variant_extractor="length_bucket",
+    # enable_pareto_variant=True,
+    # enable_trust_variant={"trusted_agents": [...],
+    #                       "min_trusted_invocations": 25,
+    #                       "max_probation_share": 0.10,
+    #                       "detect_inflated_claims": True},
     # drift_at=150, drift_agents=[...],
     # payload_generator=my_workload_fn,
+    # preference_generator=my_preference_fn,
 )
 
 ALL_SCENARIOS = [..., SCENARIO_MY_THING]
@@ -188,7 +203,12 @@ class MyStrategy(Strategy):
     def __init__(self, ...):
         ...
 
-    def select(self, candidates: List[str], payload: str = "") -> str:
+    def select(
+        self,
+        candidates: List[str],
+        payload: str = "",
+        preferences: Optional[Dict[str, float]] = None,
+    ) -> str:
         ...
 
     def update(self, agent_id: str, outcome: Dict[str, Any]) -> None:
@@ -207,23 +227,41 @@ strategies = [
 
 It will compete alongside the existing baselines on every scenario.
 
-### Lying / drifting / contextual agents in a custom scenario
+### Modeling adversarial / non-stationary / heterogeneous agents
 
-The `TruthSpec` dataclass supports three orthogonal axes:
+The `TruthSpec` dataclass and `Scenario` opt-ins together support
+five orthogonal axes:
 
-- **Lying**: set `claimed_quality_mean=X` to make the agent report a
-  fixed `X` regardless of its true behavior. Without this, agents
-  honestly report what they delivered on each call.
+- **Lying**: set `TruthSpec.claimed_quality_mean=X` to make the agent
+  report a fixed `X` regardless of its true behavior. Without this,
+  agents honestly report what they delivered on each call.
 - **Drift**: set `Scenario.drift_at=T` and `Scenario.drift_agents=[...]`
-  to swap the active TruthSpec list at logical step `T`. The oracle
+  to swap the active `TruthSpec` list at logical step `T`. The oracle
   flips with it.
 - **Contextual**: set `TruthSpec.context_quality_fn=fn` where
   `fn(features) -> quality_mean`. With a `payload_generator` that
   varies inputs and an `enable_linucb_variant_extractor`, the eval
   measures per-context routing.
+- **Cost-bearing**: set `TruthSpec.cost_cents=C` so cost shows up in
+  the outcome (and in `cost_score`). Combine with...
+- **Preference-driven**: set
+  `Scenario.preference_generator=fn(rng) -> {quality_score: w_q,
+  latency_score: w_l, cost_score: w_c, success_rate: w_s}` to vary
+  the caller's tradeoff per request. The runner uses
+  `simulator.preference_reward` instead of `call_reward`, and the
+  oracle picks the best agent *for that request's preferences*. Pair
+  with `enable_pareto_variant=True`.
+- **Untrusted / sybil**: spawn fresh agents that aren't on the
+  scenario's allowlist. Combine with `enable_trust_variant={...}` to
+  register an `agent_rank_protected` variant that caps their
+  collective exposure. Add `claimed_quality_mean=0.99` to make them
+  also lie about themselves and `detect_inflated_claims=True` in the
+  trust config to catch the saturation pattern.
 
-These can be combined: an agent can lie *and* drift *and* be
-context-dependent, all at once.
+These can be combined freely. The `sybil_attack` scenario is a good
+template: 3 honest agents + 10 sybils that both lie about quality and
+aren't on the allowlist; the `agent_rank_protected` variant uses
+allowlist + probation + anomaly detection together.
 
 ---
 
@@ -243,12 +281,15 @@ fools the strategy, the strategy's reward is low even though its
 ### 2. The oracle is per-step and per-trial
 
 For drift scenarios the oracle's best-agent changes mid-trial — the
-oracle reward at step `t` uses the active TruthSpec at step `t`. For
+oracle reward at step `t` uses the active `TruthSpec` at step `t`. For
 contextual scenarios the oracle is recomputed per-trial using the same
 RNG seed as the strategies see, so the oracle's payload stream
-matches the strategies' payload stream exactly. Otherwise the oracle
-would be averaging over a different distribution than what the
-strategies experienced, and regret would be junk.
+matches the strategies' payload stream exactly. For
+preference-dependent scenarios the same RNG seed regenerates the
+preference stream, and the oracle picks the best agent *for that
+request's preferences*. Otherwise the oracle would average over a
+different distribution than what the strategies experienced, and
+regret would be junk.
 
 ### 3. Strategies are reset per trial
 
@@ -283,10 +324,25 @@ changed code.
   built-in exploration handles it without help. The mechanism is in
   place for subtler drifts and longer horizons. See the discussion
   in the `concept_drift` scenario notes.
-- **No multi-objective scoring yet.** The single weighted-sum score
-  pre-commits to a quality/latency tradeoff. Stage 5 (Pareto) would
-  let the caller specify the tradeoff per-request.
+- **Sybil resistance is the easiest part of trust.** The current
+  `agent_rank_protected` variant assumes an out-of-band allowlist
+  exists. In a real deployment that allowlist is the output of an
+  identity / attestation system (ed25519 signatures, an external
+  registry) — none of which is implemented here. The eval shows the
+  *value* of having an allowlist; it doesn't show how to obtain one.
+- **Trust anomaly detector has one trick.** The inflated-claim
+  detector flags saturating-and-uniform claim distributions
+  (sybil 0.99 every call). A smarter attacker can defeat it by
+  injecting noise into their claims (e.g. claim ~0.95 with std 0.05).
+  Layered defenses (real judge, behavioral anomaly detection on
+  latency / cost patterns) would catch that; not implemented.
+- **ParetoBandit assumes all-positive preferences.** The frontier
+  step is informational under positive weights since the
+  dot-product maximizer is always Pareto-optimal. It becomes
+  load-bearing for constrained queries ("min cost subject to
+  quality ≥ 0.7"), which is a planned but unbuilt extension.
 
 The point of listing these is that the eval harness *can* surface
 each limitation — add a noisier `TruthSpec`, a longer-horizon scenario,
-or an imperfect judge, and watch the numbers move.
+an imperfect judge, or a smarter sybil that injects claim noise, and
+watch the numbers move.

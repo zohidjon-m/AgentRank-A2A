@@ -35,6 +35,10 @@ class TruthSpec:
     latency_min_ms: int = 100
     latency_max_ms: int = 100
     claimed_quality_mean: Optional[float] = None  # what the agent self-reports
+    # Per-call cost in cents (e.g. tokens * $/token estimate). Used by
+    # Pareto / multi-objective scoring. Defaults to 1 cent, which puts
+    # cost_score near 0.9 with the default 10c reference.
+    cost_cents: float = 1.0
     # Optional context-conditional quality: a function mapping a feature
     # vector to the agent's TRUE quality mean for that request. When set,
     # this overrides quality_mean. Used to model "agent A is great on
@@ -97,6 +101,7 @@ class TruthSpec:
             "true_quality_score": true_q,        # what really happened
             "latency_ms": latency_ms,
             "failure_reason": None if success else "synthetic_failure",
+            "cost_cents": float(self.cost_cents),
         }
 
     def expected_reward(
@@ -138,4 +143,39 @@ def call_reward(outcome: Dict[str, Any], weights: Dict[str, float]) -> float:
         + weights["quality_score"] * q
         + weights["latency_score"] * latency_score
         + weights["failure_rate"] * (1 - s)
+    )
+
+
+def preference_reward(outcome: Dict[str, Any], preferences: Dict[str, float]) -> float:
+    """
+    Multi-objective reward for a single call given a per-request
+    preference vector. Mirrors ParetoBandit's objective set:
+
+        [quality_score, latency_score, cost_score, success_rate]
+
+    All terms are in [0, 1] (higher is better). Used by scenarios where
+    the caller's preferred tradeoff varies per request — UCB1's fixed
+    weights can't optimize for that, but ParetoBandit can.
+
+    Preferences are auto-normalized to sum to 1 so callers can pass any
+    positive scaling.
+    """
+    s = int(outcome["success"])
+    q = float(outcome.get("true_quality_score", outcome["quality_score"]))
+    latency_score = 1.0 - min(float(outcome["latency_ms"]) / 3000.0, 1.0)
+    cost_score = 1.0 - min(
+        float(outcome.get("cost_cents", 1.0)) / 10.0, 1.0
+    )
+    objs = {
+        "quality_score": q,
+        "latency_score": latency_score,
+        "cost_score": cost_score,
+        "success_rate": float(s),
+    }
+    total = sum(max(0.0, float(preferences.get(k, 0.0))) for k in objs)
+    if total <= 0:
+        return 0.0
+    return sum(
+        objs[k] * max(0.0, float(preferences.get(k, 0.0))) / total
+        for k in objs
     )

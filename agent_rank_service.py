@@ -18,6 +18,7 @@ from domain_registry import DomainRegistry
 from config_loader import ScoringConfig
 from bandits import build_bandit
 from feature_extractor import get_extractor, PayloadFeatureExtractor
+from trust import ProbationPolicy, TrustConfig
 
 
 class AgentRankService:
@@ -36,15 +37,16 @@ class AgentRankService:
         domain: str,
         task_type: str,
         payload: str,
+        preferences: Optional[Dict[str, float]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Returns candidate agents sorted by score (highest first).
 
-        For backwards compatibility the returned dicts have the same
-        shape as before: agent_id, score, base_score, exploration_bonus,
-        n_a, metrics, bandit.
+        `preferences` is an optional per-request preference vector for
+        the multi-objective (Pareto) bandit. It is ignored by UCB1 and
+        LinUCB; ParetoBandit uses it to score the objective vectors.
         """
-        ranking, _ = self.rank_with_features(domain, task_type, payload)
+        ranking, _ = self.rank_with_features(domain, task_type, payload, preferences)
         return ranking
 
     def rank_with_features(
@@ -52,6 +54,7 @@ class AgentRankService:
         domain: str,
         task_type: str,
         payload: str,
+        preferences: Optional[Dict[str, float]] = None,
     ) -> Tuple[List[Dict[str, Any]], Optional[np.ndarray]]:
         """
         Same as rank(), but also returns the extracted feature vector
@@ -75,7 +78,14 @@ class AgentRankService:
             weights=policy["weights"],
             log_store=self.log_store,
             context_features=features,
+            preferences=preferences,
         )
+
+        # Trust pass: rearrange/tag entries based on the probation policy.
+        # Permissive default config is a no-op; non-default configs cap
+        # exposure of probation / inflated-claim agents.
+        trust_cfg = TrustConfig(**policy["trust"])
+        ranking = ProbationPolicy(trust_cfg).adjust(ranking, self.log_store)
         return ranking, features
 
     # ---- helpers -----------------------------------------------------------

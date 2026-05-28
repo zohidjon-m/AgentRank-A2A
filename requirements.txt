@@ -7,3 +7,7 @@ matplotlib>=3.5
 
 # Optional, used by judge.AnthropicJudge when ANTHROPIC_API_KEY is set.
 # anthropic>=0.40
+
+# Test suite. Install with `pip install -r requirements.txt` and run
+# with `python -m pytest tests/`.
+pytest>=7.0

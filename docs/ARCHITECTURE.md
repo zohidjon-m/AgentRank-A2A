@@ -31,21 +31,29 @@ run the eval harness, see [EVAL.md](EVAL.md).
 
 ## Request flow
 
-A single call through `agent_client.AgentClient.handle_task(domain, task_type, payload)`:
+A single call through
+`agent_client.AgentClient.handle_task(domain, task_type, payload, preferences=None)`:
 
 ```
 1. rank
-   AgentRankService.rank_with_features(domain, task_type, payload)
+   AgentRankService.rank_with_features(domain, task_type, payload, preferences)
    ├─ load policy from ScoringConfig.policy_for("nlp/summarize")
-   │  → {weights, exploration, drift, bandit, feature_extractor, bandit_params}
+   │  → {weights, exploration, drift, bandit, feature_extractor,
+   │     bandit_params, trust}
    ├─ optionally extract features = LengthBucketExtractor.extract(payload)
-   ├─ build_bandit(policy, feature_dim) → UCB1Bandit or LinUCBBandit
-   └─ bandit.rank(candidates, weights, log_store, context_features)
-      → sorted list of {agent_id, score, base_score, exploration_bonus, n_a, metrics, bandit}
+   ├─ build_bandit(policy, feature_dim) → UCB1 / LinUCB / Pareto
+   ├─ bandit.rank(candidates, weights, log_store,
+   │              context_features=..., preferences=...)
+   │  → sorted list of {agent_id, score, base_score, exploration_bonus,
+   │                    n_a, metrics, bandit, ...}
+   └─ ProbationPolicy(trust).adjust(ranking, log_store)
+      → same shape with `trust_status` added per entry; reorders so
+        trusted agents come first when the probation share cap fires.
 
 2. dispatch
    send_message({"performative": "request", "receiver": best, ...})
-   → response with {content, metrics: {success, quality_score, latency_ms, ...}}
+   → response with {content, metrics: {success, quality_score,
+                                       latency_ms, cost_cents, ...}}
 
 3. judge (if configured)
    judge.score(payload=payload, output=response.content, hint=None)
@@ -56,12 +64,18 @@ A single call through `agent_client.AgentClient.handle_task(domain, task_type, p
 
 4. log
    metrics.context_features := features.tolist() (if extractor was used)
+   metrics.cost_cents := <from agent or default>
    log_store.record_invocation(metrics)
 ```
 
 That's the entire pipeline. Every later concern — drift handling,
-contextual ranking, lying-agent defense — fits into this flow without
-changing the shape.
+contextual ranking, lying-agent defense, per-request preferences,
+sybil resistance — fits into this flow without changing the shape.
+The `preferences` arg is `None` for UCB1 / LinUCB (they ignore it)
+and a `{quality: w, latency: w, cost: w, success: w}` dict for
+ParetoBandit. The trust pass is a no-op under the permissive default
+config; non-default `trust` configs cap exposure of probation /
+flagged agents.
 
 ---
 
@@ -72,15 +86,16 @@ changing the shape.
 Read-only view over `config/scoring.json`. The interesting methods:
 
 - `policy_for(domain_key)`: returns a fully-filled policy dict (weights,
-  exploration, drift, bandit, feature_extractor, bandit_params) for the
-  given domain, falling back to defaults for missing keys.
+  exploration, drift, bandit, feature_extractor, bandit_params, trust)
+  for the given domain, falling back to defaults for missing keys.
 - `agent_default(agent_id)`: cold-start prior for an agent before any
   logs exist. Returns the per-agent prior if configured, else the
   generic `_fallback`, else `0.5` for everything.
 - `with_priors(priors)`, `with_registry(domain_key, agents)`,
-  `with_drift_half_life(...)`, `with_bandit(...)`: return cloned configs
-  with overrides applied. Used by the eval harness to compose
-  per-scenario views without touching the persisted config file.
+  `with_drift_half_life(...)`, `with_bandit(...)`, `with_trust(...)`:
+  return cloned configs with overrides applied. Used by the eval
+  harness to compose per-scenario views without touching the persisted
+  config file.
 
 The "defensive fill" pattern in `policy_for` (`{**default, **explicit}`)
 means a policy can omit any subset of keys and still produce a valid
@@ -103,6 +118,7 @@ judge_name             TEXT  -- which judge produced quality_score (NULL if none
 judge_reason           TEXT  -- one-line rationale
 agent_claimed_quality  REAL  -- agent's self-report before judge override
 context_features       TEXT  -- JSON-encoded feature vector (NULL if no extractor)
+cost_cents             REAL  -- per-call cost (NULL if not reported)
 ```
 
 Auto-migration: each later-added column has an idempotent
@@ -112,14 +128,24 @@ upgrade silently.
 Key reads:
 
 - `compute_metrics(agent_id, half_life_calls=None)`: aggregate
-  metrics. When half-life is set, log entries are weighted by
+  success / quality / latency / failure. When half-life is set, log
+  entries are weighted by
   `0.5 ** ((current_tick - entry.id) / half_life_calls)`. Cold start
   (no logs) returns the agent's prior from the config.
+- `get_objective_vector(agent_id, half_life_calls, cost_reference_cents)`:
+  the same metrics plus a `cost_score = 1 - min(avg_cost/cost_ref, 1)`
+  dimension. Used by `ParetoBandit`. Cost samples falling back to the
+  config's per-agent prior when no costs have been logged.
 - `get_weighted_counts(half_life_calls=None)`: `(total_weight,
-  {agent: agent_weight})` — used by UCB1 for the exploration bonus.
-  Batched single read, not per-agent.
+  {agent: agent_weight})` — used by UCB1 / Pareto for the exploration
+  bonus. Batched single read, not per-agent.
 - `get_contextual_logs(agent_id)`: rows that have a stored
   `context_features` value. Used by LinUCB to refit.
+- `recent_selections(n)`: last `n` `agent_id`s, newest last. Used by
+  `ProbationPolicy` to compute the rolling probation share.
+- `recent_claimed_quality(agent_id, n)`: last `n` claimed-quality
+  scores for the agent (`agent_claimed_quality` if a judge ran, else
+  `quality_score`). Used by the inflated-claim anomaly detector.
 
 The id column is also the logical clock: `MAX(id)` is "now" in
 invocation counts, and the age of an entry is `now - entry.id`. We use
@@ -135,10 +161,14 @@ non-trivial concern: `bandits.LinUCBBandit` ties at cold start, and
 stable sort means the first candidate wins. That's why we have an
 explicit warm-start phase (see below).
 
-### `bandits.py` — `BanditPolicy`, `UCB1Bandit`, `LinUCBBandit`, `build_bandit`
+### `bandits.py` — `BanditPolicy`, `UCB1Bandit`, `LinUCBBandit`, `ParetoBandit`, `build_bandit`
 
 The factory `build_bandit(policy, feature_dim)` reads
-`policy["bandit"]` and constructs the right instance. Two implementations today:
+`policy["bandit"]` and constructs the right instance. All bandits
+share the same `rank(candidates, weights, log_store,
+context_features=None, preferences=None)` signature so
+`AgentRankService` treats them interchangeably; each implementation
+ignores the kwargs it doesn't need. Three implementations today:
 
 #### UCB1Bandit (context-blind)
 
@@ -178,9 +208,33 @@ The fix: until every agent has `warm_start_n` (default 3)
 observations, the least-explored agent is forced to the top of the
 ranking. After warm-up, LinUCB takes over.
 
+#### ParetoBandit (multi-objective, context-blind)
+
+```
+objective(a) = [quality_score, latency_score, cost_score, success_rate]
+optimism(a)  = α · √( ln(1 + N_eff) / (1 + n_a_eff) )      # one scalar
+ucb(a)       = min(1, objective(a) + optimism(a))           # per-dim
+score(a)     = preferences · ucb(a)
+```
+
+Per request the caller passes a `preferences` dict (`{"quality_score":
+0.7, "latency_score": 0.2, "cost_score": 0.1, "success_rate": 0.0}`).
+ParetoBandit projects each agent's optimistic objective vector onto
+the preference direction and ranks by the resulting scalar. It also
+computes the Pareto frontier of the optimistic vectors and tags each
+entry with `on_frontier` for observability — under strictly positive
+preferences the dot-product maximizer is always on the frontier, so
+the frontier tag is informational. It becomes load-bearing for the
+planned constrained-query extension ("min cost subject to quality
+≥ 0.7").
+
+Cost handling: `LogStore.get_objective_vector` divides observed cost
+by `bandit_params.cost_reference_cents` (default `10.0`) and inverts
+so higher is better, matching the convention of the other objectives.
+
 #### Reward function
 
-Both bandits use the same per-call reward, computed in `_per_call_reward`:
+UCB1 and LinUCB use the same per-call reward, computed in `_per_call_reward`:
 
 ```
 r = w_SR · success + w_QS · quality + w_LS · latency_score + w_FR · (1 - success)
@@ -190,6 +244,28 @@ Where `latency_score = 1 - min(latency_ms / 3000, 1)` and `quality` is
 the judge's verdict (if a judge ran) else the agent's self-report. The
 formula is the same one used by UCB1's "base" — so LinUCB's reward
 matches what UCB1 sees aggregated.
+
+ParetoBandit doesn't reduce its objectives to a scalar reward; it
+keeps them as a vector and picks based on the per-request preferences.
+
+### `pareto.py` — `dominates`, `pareto_frontier_indices`, `weighted_pick`, `normalize_preferences`
+
+Pure utility module — no I/O, no state. Three helpers used by
+`ParetoBandit`:
+
+- `dominates(a, b)`: True iff `a` is `>=` `b` on every objective and
+  `>` on at least one.
+- `pareto_frontier_indices(points)`: O(n²) Pareto frontier. Fine for
+  our scale (single-digit candidates per request); swap for a faster
+  algorithm if you ever have hundreds of candidates.
+- `weighted_pick(points, preferences, restrict_to_frontier=True)`:
+  argmax of `preferences · point`, optionally restricted to the
+  frontier. The restriction is a no-op for strictly positive
+  preferences but matters for the planned constrained queries.
+- `normalize_preferences(prefs_dict, keys)`: projects a preferences
+  dict onto `keys` in order, fills missing keys with 0, normalizes so
+  the projection sums to 1. Defaults to uniform if the input is empty
+  / non-positive.
 
 ### `feature_extractor.py` — `PayloadFeatureExtractor`, `LengthBucketExtractor`
 
@@ -203,6 +279,42 @@ The features matter: too few dims and LinUCB can't distinguish
 contexts; too many and you'll overfit with limited data. Length
 bucketing is the bare minimum to make "this is short, that is long"
 representable.
+
+### `trust.py` — `TrustConfig`, `ProbationPolicy`
+
+Stage 6's defense against sybil floods and inflated self-reports. The
+policy applies *after* the bandit ranks candidates — the bandit still
+sees and scores everyone; the trust pass rearranges the final order
+when the probation-share quota is exhausted, and tags each entry
+with `trust_status` for observability:
+
+- `"trusted"` — agent is on the allowlist OR has earned trust through
+  accumulation.
+- `"probation"` — not on allowlist, hasn't earned trust yet.
+- `"flagged_inflated"` — anomaly detector tripped (recent claimed
+  quality is suspiciously uniform-and-high).
+- `"demoted"` — was in probation AND the share cap was hit, so the
+  policy moved the entry below the trusted ones.
+
+`TrustConfig` knobs:
+
+| Knob | Default | Effect |
+|---|---|---|
+| `trusted_agents` | `[]` | Allowlist of pre-vetted agents (in production: signed-identity registry). Always trusted, regardless of call count. |
+| `min_trusted_invocations` | `0` | Calls needed to earn trust by accumulation (when not on the allowlist). `0` disables the accumulation path. |
+| `max_probation_share` | `1.0` | Probation+flagged agents combined can occupy at most this fraction of the rolling window. `1.0` = no cap (default behavior). |
+| `window_size` | `50` | How many recent selections the share is measured over. |
+| `detect_inflated_claims` | `false` | Run the anomaly detector. |
+| `inflated_quality_floor` | `0.95` | Flag if recent claimed quality mean ≥ this. Calibrated so 0.99-saturating sybils get caught but a genuinely-consistent 0.9 agent does not. |
+| `inflated_stdev_ceiling` | `0.02` | Flag if recent claimed-quality stdev ≤ this (i.e. unnaturally uniform). |
+| `inflated_min_calls` | `5` | Minimum sample size before the detector fires. |
+
+The two unimplemented mechanisms from the Stage 6 design
+(signed-identity attestation, per-agent rate limits) require
+multi-process infrastructure that single-process eval can't exercise.
+The allowlist field is the integration point for attestation: in
+production, agents whose ed25519 signatures verify against an
+external identity registry get added to `trusted_agents`.
 
 ### `judge.py` — `QualityJudge`, three implementations
 
@@ -231,23 +343,33 @@ See the `lying_agent` scenario for the proof.
 
 ### `agent_rank_service.py` — `AgentRankService`
 
-Intentionally thin. Builds the bandit, extracts features, delegates.
-Two public methods:
+Intentionally thin. Builds the bandit, extracts features, delegates,
+then runs the trust pass. Two public methods:
 
-- `rank(domain, task_type, payload)` — returns the ranked list only.
-  Backward-compatible signature.
-- `rank_with_features(domain, task_type, payload)` — returns
-  `(ranking, features)` so `AgentClient` can persist features alongside
-  the invocation.
+- `rank(domain, task_type, payload, preferences=None)` — returns the
+  ranked list only. Backward-compatible signature.
+- `rank_with_features(domain, task_type, payload, preferences=None)` —
+  returns `(ranking, features)` so `AgentClient` can persist features
+  alongside the invocation.
+
+`preferences` is forwarded to the bandit (ParetoBandit uses it; UCB1
+and LinUCB ignore it). The `ProbationPolicy` runs unconditionally
+but is a no-op under the permissive default config.
 
 ### `agent_client.py` — `AgentClient`
 
-Owns the full request lifecycle: rank → dispatch → judge → log.
-Important: the judge is called *after* dispatch (we need real output to
-score) and the result *replaces* the agent's self-reported
+Owns the full request lifecycle:
+rank → dispatch → judge → log. Signature is
+`handle_task(domain, task_type, payload, preferences=None)`; the
+preferences flow through to the bandit when ParetoBandit is
+configured.
+
+Important: the judge is called *after* dispatch (we need real output
+to score) and the result *replaces* the agent's self-reported
 `quality_score` before logging. The original claim is preserved in
 `agent_claimed_quality` so you can later answer "did the agent ever
-inflate?"
+inflate?" The trust policy's inflated-claim anomaly detector reads
+exactly that column.
 
 If the judge raises, the error is captured in `metrics.judge_error` but
 doesn't break the request flow — a degraded log entry is preferable to
@@ -312,7 +434,17 @@ A complete policy:
   "drift": { "half_life_calls": null },
   "bandit": "ucb1",
   "feature_extractor": null,
-  "bandit_params": {}
+  "bandit_params": {},
+  "trust": {
+    "trusted_agents": [],
+    "min_trusted_invocations": 0,
+    "max_probation_share": 1.0,
+    "window_size": 50,
+    "detect_inflated_claims": false,
+    "inflated_quality_floor": 0.95,
+    "inflated_stdev_ceiling": 0.02,
+    "inflated_min_calls": 5
+  }
 }
 ```
 
@@ -323,6 +455,39 @@ For LinUCB:
   "bandit": "linucb",
   "feature_extractor": "length_bucket",
   "bandit_params": { "alpha": 0.5, "ridge": 1.0, "warm_start_n": 3 }
+}
+```
+
+For ParetoBandit:
+
+```json
+{
+  "bandit": "pareto",
+  "bandit_params": {
+    "alpha": 0.2,
+    "cost_reference_cents": 10.0,
+    "default_preferences": {
+      "quality_score": 0.5,
+      "latency_score": 0.2,
+      "cost_score": 0.2,
+      "success_rate": 0.1
+    }
+  }
+}
+```
+
+For trust-protected ranking (any bandit can opt into a non-default
+trust policy):
+
+```json
+{
+  "bandit": "ucb1",
+  "trust": {
+    "trusted_agents": ["SummarizerFast", "SummarizerQuality"],
+    "min_trusted_invocations": 25,
+    "max_probation_share": 0.10,
+    "detect_inflated_claims": true
+  }
 }
 ```
 
@@ -384,7 +549,31 @@ So contextual scenarios produce the same payload stream for the
 strategy *and* the oracle. The oracle is recomputed per trial with
 the same seed; without that, the oracle would average over a different
 distribution than the strategies actually saw, and regret numbers
-would be wrong.
+would be wrong. The same applies to per-request preferences in
+ParetoBandit scenarios — same seed → same preference stream → honest
+oracle.
+
+### Why is trust a separate pass instead of a bandit feature?
+
+The bandit's job is "given the metrics I see, what's the best agent?"
+The trust policy's job is "is this metric stream trustworthy in the
+first place?" Mixing those collapses two orthogonal concerns into
+one component. Keeping trust as a post-pass means any bandit (UCB1,
+LinUCB, ParetoBandit, anything we add later) gets sybil resistance
+for free, and the trust policy itself can be swapped — allowlist
+today, signed-identity attestation tomorrow — without touching the
+bandits.
+
+### Why does ParetoBandit inflate per-dimension instead of using a single UCB term?
+
+The whole point of multi-objective scoring is that different agents
+win on different dimensions. Adding one global exploration scalar
+to the projected score would behave like UCB1 with a fancier base —
+agents that are confident on quality but uncertain on latency would
+get the same exploration boost across all objectives. Per-dimension
+inflation lets exploration cost differ by dimension, which is the
+right behavior when one agent has lots of "this is fast" evidence but
+no "this is high quality" evidence.
 
 ---
 
@@ -397,7 +586,9 @@ would be wrong.
 | Add a new bandit policy | New class in `bandits.py`, dispatch in `build_bandit`, optionally new keys in `_DEFAULT_POLICY["bandit_params"]` |
 | Add a new feature extractor | New class in `feature_extractor.py`, register in `FEATURE_EXTRACTORS` |
 | Add a new judge | New class in `judge.py` implementing `QualityJudge`, optionally wire into `run_demo.build_judge()` |
-| Add a new eval scenario | New `Scenario` in `evaluation/scenarios.py`, append to `ALL_SCENARIOS` |
+| Add a new objective dimension | Add column in `log_store.py` schema (auto-migrate), aggregator in `get_objective_vector`, key in `ParetoBandit.OBJECTIVE_KEYS`, scoring weight in config defaults |
+| Add a new trust mechanism | Either extend `TrustConfig` + `ProbationPolicy` in `trust.py`, or implement a separate policy class and chain after `ProbationPolicy.adjust` in `AgentRankService` |
+| Add a new eval scenario | New `Scenario` in `evaluation/scenarios.py`, append to `ALL_SCENARIOS`. Optionally set `enable_*_variant` flags to register comparison variants. |
 | Add a new selection strategy to the eval | New class in `evaluation/strategies.py`, instantiate in `run_eval.build_strategies()` |
 
 See [EVAL.md](EVAL.md) for the eval-specific extension points.

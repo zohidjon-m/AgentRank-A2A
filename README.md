@@ -114,12 +114,50 @@ SummarizerFast is great on short text, terrible on long. SummarizerQuality is th
 
 ---
 
+### 6. `preference_dependent` — different requests want different tradeoffs
+
+Three agents with very different cost / quality / latency profiles (premium-slow-expensive, balanced, budget-fast-cheap). Each request carries its own preference vector — quality-first, latency-first, or cost-first. **No single agent serves all three preferences.** UCB1 picks one global winner and pays linear regret on the other ~66% of requests. ParetoBandit reads per-request preferences and routes accordingly.
+
+| Strategy | Final regret | Selection share |
+|---|---:|---|
+| **agent_rank_pareto** | **1.12** | BudgetFast=64%, PremiumSlow=33% (routes by preference) |
+| random | 65.16 | 33% each |
+| round_robin | 66.33 | 33% each |
+| epsilon_greedy | 111.25 | PremiumSlow=93% (one global winner) |
+| agent_rank | 112.52 | PremiumSlow=92% |
+| greedy_prior | 116.98 | PremiumSlow=100% |
+
+![regret curves — preference_dependent](docs/images/regret_preference_dependent.png)
+
+**ParetoBandit drops regret 100× vs UCB1.** When the caller's tradeoff varies per request, a fixed scoring formula is structurally incapable of optimizing — the answer requires reading the per-request preferences.
+
+---
+
+### 7. `sybil_attack` — an attacker floods the registry with fake agents
+
+An attacker spawns 10 fresh agents with inflated cold-start priors (claimed quality 0.99, actually 0.05). They also self-report perfect quality on every call, so without a judge the bandit has no signal to learn from observed metrics alone. Without protection, UCB1 wastes exploration on each, greedy locks onto the highest-prior sybil, and the system collapses. With probation + anomaly detection, sybils are bounded.
+
+| Strategy | Final regret | Selection share |
+|---|---:|---|
+| **agent_rank_protected** | **12.79** | SQ=88%, sybils capped at 10% combined |
+| round_robin | 105.02 | spread evenly across 13 agents |
+| random | 105.72 | spread evenly across 13 agents |
+| agent_rank | 114.17 | each sybil ~10%, real agents starved |
+| epsilon_greedy | 115.96 | sybils dominate |
+| greedy_prior | 117.76 | **SybilAgent_00=100%** (top prior wins) |
+
+![regret curves — sybil_attack](docs/images/regret_sybil_attack.png)
+
+**Protected variant drops regret 9× vs unprotected AgentRank.** The probation policy caps non-allowlisted agents at 10% collective exposure; the inflated-claim anomaly detector flags sybils whose claimed-quality is suspiciously uniform-and-high (≥0.95 with ~zero variance). Honest agents that consistently deliver e.g. 0.9 are not flagged — the threshold is calibrated to catch saturation, not consistency.
+
+---
+
 ## What this proves
 
 Pick any scenario above and try a baseline. Each baseline that wins one scenario loses catastrophically on another:
 
-- `greedy_prior` wins #1, loses badly on #2, #3, #5
-- `agent_rank` (UCB1) wins #2 and #4, loses badly on #3 and #5
+- `greedy_prior` wins #1, loses badly on #2, #3, #5, #6, #7
+- `agent_rank` (UCB1) wins #2 and #4, loses badly on #3, #5, #6, #7
 - `random` is mediocre everywhere
 
 Only **AgentRank with the right policy plug-ins** stays near oracle across all scenarios:
@@ -131,8 +169,10 @@ Only **AgentRank with the right policy plug-ins** stays near oracle across all s
 | lying_agent | `agent_rank_judged` | 1.34 |
 | concept_drift | `agent_rank` (UCB1 with built-in exploration) | 1.10 |
 | context_aware | `agent_rank_linucb` | 2.60 |
+| preference_dependent | `agent_rank_pareto` | 1.12 |
+| sybil_attack | `agent_rank_protected` | 12.79 |
 
-That's the entire pitch: **one consistent framework with pluggable bandit policies and an external quality signal, that doesn't get fooled by any of the failure modes a real multi-agent ecosystem will throw at it.**
+That's the entire pitch: **one consistent framework with pluggable bandit policies, an external quality signal, multi-objective routing, and trust controls — robust to every failure mode a real multi-agent ecosystem will throw at it.**
 
 ---
 
@@ -173,14 +213,14 @@ python -m evaluation.run_eval --steps 1000 --trials 20
 | # | Stage | Status | What it gives you |
 |---|---|---|---|
 | 1 | Foundation (UCB1 + config + SQLite) | ✅ | Per-domain config, exploration, persistent logs |
-| – | Evaluation harness | ✅ | 5 baseline strategies, 5 scenarios, regret/share plots |
+| – | Evaluation harness | ✅ | 5 baseline strategies, 7 scenarios, regret/share plots |
 | 2 | LLM-as-judge quality signal | ✅ | Catches lying agents (heuristic / oracle / Anthropic stub) |
 | 3 | Concept drift via exponential decay | ✅ | Adapts to agent behavior changing over time |
 | 4 | Contextual bandit (LinUCB) | ✅ | Per-request routing by payload features |
-| 5 | Multi-objective Pareto scoring | ⏳ | Per-request user preference vectors |
-| 6 | Trust / sybil resistance | ⏳ | Agent attestation + anomaly detection |
+| 5 | Multi-objective Pareto scoring | ✅ | Per-request user preference vectors |
+| 6 | Trust / sybil resistance | ✅ | Allowlist + probation + anomaly detection |
 
-The **AnthropicJudge** is wired but ungated until `ANTHROPIC_API_KEY` is supplied. The rest of the system works fully offline.
+The **AnthropicJudge** is wired but ungated until `ANTHROPIC_API_KEY` is supplied. Signed-identity attestation and per-agent rate limits (Stage 6 design) are documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) but not implemented — they require multi-process infrastructure outside the scope of a single-process eval. The rest of the system works fully offline.
 
 ---
 
@@ -330,8 +370,27 @@ See [`docs/EVAL.md`](docs/EVAL.md) for how to interpret the output, how to add n
 
 ## Roadmap
 
-**Stage 5 — multi-objective Pareto scoring.** Replace the single weighted-sum score with a per-request preference vector (`{quality: 0.7, latency: 0.2, cost: 0.1}`) and rank on the Pareto frontier. Lets the caller express tradeoffs instead of hardcoding them in config.
+All seven planned stages are implemented and validated. Future work:
 
-**Stage 6 — trust / sybil resistance.** Agent attestation via signed identities, rate-limited log submissions, anomaly detection on metric distributions, a probation pool for new agents. Necessary for any real marketplace where anyone can register an agent.
+- **Signed-identity attestation** (deferred from Stage 6) — ed25519
+  keypairs per agent, signature verification on log submission, an
+  out-of-band identity registry. Requires multi-process infrastructure
+  that doesn't fit the single-process eval but is the missing piece
+  for real-world deployment.
+- **Per-agent rate limiting** — caps on log submissions per minute
+  per agent. Same multi-process caveat.
+- **Real-LLM agents in the eval** — current synthetic agents are
+  parametric. The `Strategy` interface is plug-compatible with the
+  real `AgentClient`, so swapping in API-backed summarizers is
+  mechanical, just expensive.
+- **Richer feature extractors** — `LengthBucketExtractor` has 4 dims.
+  An embedding-based extractor would unlock content-aware routing
+  (e.g., "legal text → SummarizerLegal, casual text → SummarizerCasual").
+- **Constrained Pareto queries** — current ParetoBandit treats
+  preferences as a scoring direction. The natural extension is "min
+  cost subject to quality ≥ 0.7" — a constrained optimization over
+  the frontier.
 
-Both are scoped but not yet implemented. The current ranker already covers the four hardest failure modes (wrong priors, lying agents, drift, context-dependence) and the eval harness is set up to validate Stages 5 and 6 the same way it validated 1–4: each new mechanism gets its own scenario where it's measurably necessary.
+See [`docs/EVAL.md`](docs/EVAL.md) for how to add new scenarios that
+prove a new mechanism's value, and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+for where each future piece would plug in.

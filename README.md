@@ -196,12 +196,15 @@ python run_demo.py
 # prints the ranking and selection share.
 python scripts/smoke_test.py
 
-# run the full evaluation suite: 5 strategies × 5 scenarios × 10 trials,
+# run the full evaluation suite: 5 strategies × 7 scenarios × 10 trials,
 # writes JSON + matplotlib plots into evaluation/results/.
 python -m evaluation.run_eval
 
 # longer / more careful run
 python -m evaluation.run_eval --steps 1000 --trials 20
+
+# run the test suite (70 tests, ~7s)
+python -m pytest tests/
 ```
 
 `run_demo.py` will auto-pick the AnthropicJudge if `ANTHROPIC_API_KEY` is set in your environment, otherwise it uses the offline `MockHeuristicJudge`.
@@ -300,6 +303,14 @@ agentrank-a2a/
 │
 ├── scripts/smoke_test.py      # 15-request non-interactive demo
 ├── run_demo.py                # interactive demo with judge wired in
+│
+├── tests/                     # pytest sanity + integration suite (~7s)
+│   ├── test_pareto.py         # frontier math, weighted pick, normalize
+│   ├── test_log_store.py      # decay arithmetic, cost score, cold start
+│   ├── test_trust.py          # allowlist, share cap, anomaly detector
+│   ├── test_config.py         # default-fill, composers, agent priors
+│   ├── test_bandits.py        # UCB1, LinUCB warm-start + routing, Pareto
+│   └── test_scenarios_integration.py   # every documented winner still wins
 │
 └── docs/
     ├── ARCHITECTURE.md        # detailed component design
